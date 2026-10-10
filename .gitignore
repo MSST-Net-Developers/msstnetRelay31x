@@ -1,0 +1,23 @@
+# Go binary output
+msstnetRelay31x
+msstnetRelay
+*.exe
+*.out
+*.test
+
+# Go build cache
+/vendor/
+
+# GoLand IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / config files with secrets
+*.env
+.env*
+config.yaml
+config.yml
