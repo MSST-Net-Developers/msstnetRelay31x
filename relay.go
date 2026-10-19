@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -35,6 +36,8 @@ type relayLimits struct {
 	discDedupMax        int
 	discMaxFanout       int
 	discRequireSenderIn bool
+	discAuth            authMode
+	discAuthSkew        time.Duration // accepted |client clock - relay clock|
 	maintenanceInterval time.Duration
 }
 
@@ -61,7 +64,12 @@ type relay struct {
 	discEgress   *tokenBucket
 	discDedup    *dedupCache
 	rooms        roomPeerLookup // nil: discovery peers unavailable (no Coordinator)
-	fanout       []netip.AddrPort
+	fanout       []fanoutTarget
+
+	// Secure discovery; nil/zero unless lim.discAuth != authOff.
+	discReplay *replayGuard
+	txCounter  uint64 // last counter used on a 0x0C packet
+	deliverBuf []byte // 0x0C egress scratch
 
 	nextMaintenance time.Time
 }
@@ -83,9 +91,22 @@ func newRelay(out datagramWriter, lim relayLimits, rooms roomPeerLookup, st *sta
 		r.discIngress = newTokenBucket(lim.discIngressRate, lim.discIngressBurst)
 		r.discEgress = newTokenBucket(lim.discEgressRate, lim.discEgressBurst)
 		r.discDedup = newDedupCache(lim.discDedupMax, lim.discDedupTTL)
-		r.fanout = make([]netip.AddrPort, 0, lim.discMaxFanout)
+		r.fanout = make([]fanoutTarget, 0, lim.discMaxFanout)
+		if lim.discAuth != authOff {
+			r.discReplay = newReplayGuard(lim.discMaxSessions, lim.discSessionTTL, lim.discAuthSkew)
+			r.deliverBuf = make([]byte, 0, headerLen+sdiscCounterLen+maxDatagram+sdiscTagLen)
+		}
 	}
 	return r
+}
+
+// fanoutTarget is one discovery recipient. keys != nil means the recipient
+// registered with authentication and receives 0x0C; otherwise it receives the
+// bare IPv4 packet (3.0.x).
+type fanoutTarget struct {
+	id   uint64
+	addr netip.AddrPort
+	keys *sdiscKeys
 }
 
 // handle processes one datagram received from src. buf aliases the receive
@@ -108,7 +129,7 @@ func (r *relay) handle(buf []byte, src netip.AddrPort, now time.Time) {
 
 	switch p.typ {
 	case typRegister, typKeepalive, typPunch:
-		r.register(r.sessions, p.srcID, src, now, "session")
+		r.register(r.sessions, p.srcID, src, now, "session", false)
 
 	case typData:
 		r.forwardData(p, src, now)
@@ -137,26 +158,41 @@ func (r *relay) handle(buf []byte, src netip.AddrPort, now time.Time) {
 			r.stats.dropUnknownType.Add(1)
 			return
 		}
-		r.register(r.discSessions, p.srcID, src, now, "discovery")
+		if r.lim.discAuth == authRequired {
+			r.stats.dropUnauthenticated.Add(1)
+			return
+		}
+		r.register(r.discSessions, p.srcID, src, now, "discovery", false)
 
 	case typDiscoveryData:
 		if r.discSessions == nil {
 			r.stats.dropUnknownType.Add(1)
 			return
 		}
+		if r.lim.discAuth == authRequired {
+			r.stats.dropUnauthenticated.Add(1)
+			return
+		}
 		r.forwardDiscovery(p, src, now)
+
+	case typSecureDiscoveryRegister, typSecureDiscoveryData:
+		if r.discReplay == nil {
+			r.stats.dropUnknownType.Add(1)
+			return
+		}
+		r.secureDiscovery(p, src, now)
 
 	default:
 		r.stats.dropUnknownType.Add(1)
 	}
 }
 
-func (r *relay) register(reg *registry, id uint64, src netip.AddrPort, now time.Time, kind string) {
+func (r *relay) register(reg *registry, id uint64, src netip.AddrPort, now time.Time, kind string, secure bool) {
 	if !validDeviceID(id) {
 		r.stats.invalidRegistrant.Add(1)
 		return
 	}
-	switch reg.register(id, src, now) {
+	switch reg.register(id, src, now, secure) {
 	case regNew:
 		r.stats.registrations.Add(1)
 		r.logs.printf(now, "%s registered: id=%08x addr=%s", kind, id, src)
@@ -168,6 +204,8 @@ func (r *relay) register(reg *registry, id uint64, src netip.AddrPort, now time.
 		r.logs.printf(now, "%s table full (%d): rejecting id=%08x", kind, reg.max, id)
 	case regInvalidAddr:
 		r.stats.invalidRegistrant.Add(1)
+	case regDenied:
+		r.stats.dropUnauthenticated.Add(1)
 	case regRefreshed:
 	}
 }
@@ -247,17 +285,24 @@ func (r *relay) forwardProbe(p packet, src netip.AddrPort, now time.Time) {
 	}
 }
 
-// forwardDiscovery fans a discovery IPv4 packet out to the other discovery
-// participants of the claimed room that are registered at this relay.
+// forwardDiscovery fans a legacy (unauthenticated) discovery IPv4 packet out
+// to the other discovery participants of the claimed room that are registered
+// at this relay.
 func (r *relay) forwardDiscovery(p packet, src netip.AddrPort, now time.Time) {
 	roomID, ipPkt, ok := parseDiscoveryPayload(p.payload)
 	if !ok || !validDeviceID(p.srcID) {
 		r.stats.dropMalformed.Add(1)
 		return
 	}
+	// An ID that authenticated recently cannot be impersonated by
+	// unauthenticated packets (optional mode).
+	if r.discReplay != nil && r.discSessions.secureBound(p.srcID, now) {
+		r.stats.dropUnauthenticated.Add(1)
+		return
+	}
 	// Data packets refresh the discovery binding, as in 3.0.x (this grants
 	// nothing beyond what a register packet already does).
-	r.register(r.discSessions, p.srcID, src, now, "discovery")
+	r.register(r.discSessions, p.srcID, src, now, "discovery", false)
 
 	if !r.discIngress.allow(now) {
 		r.stats.dropRateLimited.Add(1)
@@ -286,22 +331,115 @@ func (r *relay) forwardDiscovery(p packet, src netip.AddrPort, now time.Time) {
 		r.stats.dropRoomUnknown.Add(1)
 		return
 	}
+	r.fanOutDiscovery(p.srcID, src, peers, ipPkt, false, r.lim.discRequireSenderIn, now)
+}
 
+// secureDiscovery handles authenticated discovery register (0x0A) and data
+// (0x0B). Nothing has side effects on relay state until the tag and counter
+// have been verified, so forged packets cannot rebind an address, consume a
+// device's rate budget or replay-window state.
+//
+// The global ingress budget is applied after verification: verification is
+// one HMAC (the X25519 work happens in the room-cache workers), and charging
+// forged packets to the shared budget would let them starve real ones.
+func (r *relay) secureDiscovery(p packet, src netip.AddrPort, now time.Time) {
+	isData := p.typ == typSecureDiscoveryData
+	counter, roomID, ipPkt, ok := parseSecureDiscoveryPayload(p.payload, isData)
+	if !ok || !validDeviceID(p.srcID) || p.dstID != 0 {
+		r.stats.dropMalformed.Add(1)
+		return
+	}
+	if r.rooms == nil {
+		r.stats.dropRoomUnknown.Add(1)
+		return
+	}
+	peers, ok := r.rooms.peers(roomID, now)
+	if !ok {
+		r.stats.dropRoomUnknown.Add(1)
+		return
+	}
+	// The key comes from the claimed room's list, so authentication also
+	// proves the sender is a discovery participant of that room.
+	var keys *sdiscKeys
+	found := false
+	for i := range peers {
+		if peers[i].id == p.srcID {
+			keys, found = peers[i].keys, true
+			break
+		}
+	}
+	if !found {
+		r.stats.dropNotInRoom.Add(1)
+		return
+	}
+	if keys == nil || !sdiscVerify(&keys.c2r, p.raw) {
+		r.stats.dropAuthFailed.Add(1)
+		return
+	}
+	switch r.discReplay.accept(p.srcID, counter, now) {
+	case replayOK:
+	case replayFull:
+		r.stats.sessionsFull.Add(1)
+		return
+	default:
+		r.stats.dropReplay.Add(1)
+		return
+	}
+	// Authenticated: the sender may (re)bind its discovery address, which
+	// also covers NAT rebinding and roaming.
+	r.register(r.discSessions, p.srcID, src, now, "discovery", true)
+	if !isData {
+		return
+	}
+
+	if !r.discIngress.allow(now) {
+		r.stats.dropRateLimited.Add(1)
+		return
+	}
+	if !r.discDedup.firstSeen(p.srcID, ipPkt, now) {
+		r.stats.dropDuplicate.Add(1)
+		return
+	}
+	if !r.discSender.allow(p.srcID, now) {
+		r.stats.dropRateLimited.Add(1)
+		return
+	}
+	if !r.discSessions.boundTo(p.srcID, src, now) { // table full
+		r.stats.dropUnverifiedSrc.Add(1)
+		return
+	}
+	r.fanOutDiscovery(p.srcID, src, peers, ipPkt, true, true, now)
+}
+
+// fanOutDiscovery sends ipPkt to the room's other participants registered
+// here. verified reports whether senderID was authenticated.
+func (r *relay) fanOutDiscovery(senderID uint64, src netip.AddrPort, peers []discPeer, ipPkt []byte, verified, requireSender bool, now time.Time) {
 	r.fanout = r.fanout[:0]
 	senderInRoom := false
-	for _, id := range peers {
-		if id == p.srcID {
+	for _, peer := range peers {
+		if peer.id == senderID {
 			senderInRoom = true
 			continue
 		}
 		if len(r.fanout) >= r.lim.discMaxFanout {
 			continue // keep scanning for the sender
 		}
-		if addr, ok := r.discSessions.lookup(id, now); ok && addr != src {
-			r.fanout = append(r.fanout, addr)
+		b, ok := r.discSessions.get(peer.id, now)
+		if !ok || b.addr == src {
+			continue
 		}
+		t := fanoutTarget{id: peer.id, addr: b.addr}
+		if b.secure {
+			// Never downgrade an authenticated recipient to bare IPv4; if
+			// its key is no longer listed it gets nothing.
+			if peer.keys == nil {
+				continue
+			}
+			t.keys = peer.keys
+		}
+		r.fanout = append(r.fanout, t)
 	}
-	if r.lim.discRequireSenderIn && !senderInRoom {
+	if requireSender && !senderInRoom {
 		r.stats.dropNotInRoom.Add(1)
 		return
 	}
@@ -312,11 +450,48 @@ func (r *relay) forwardDiscovery(p packet, src netip.AddrPort, now time.Time) {
 		r.stats.dropRateLimited.Add(1)
 		return
 	}
-	for _, addr := range r.fanout {
-		if r.send(ipPkt, addr, now) {
+	var deliver []byte // built on first secure recipient
+	for _, t := range r.fanout {
+		out := ipPkt
+		if t.keys != nil {
+			if deliver == nil {
+				deliver = r.buildDeliver(senderID, ipPkt, verified, now)
+			}
+			out = r.sealDeliver(deliver, t.id, t.keys)
+		}
+		if r.send(out, t.addr, now) {
 			r.stats.discoveryForwarded.Add(1)
 		}
 	}
+}
+
+// buildDeliver writes a 0x0C packet without dst_id and tag into deliverBuf:
+//
+//	hdr(type 0x0C, flags, src_id=sender, dst_id=recipient) | counter u64 | ipv4 | tag
+//
+// One counter is used for all recipients of a packet (each has its own key
+// and dst_id); the read loop is sequential, so counters increase per
+// recipient.
+func (r *relay) buildDeliver(senderID uint64, ipPkt []byte, verified bool, now time.Time) []byte {
+	var flags byte
+	if verified {
+		flags = sdiscFlagSenderVerified
+	}
+	r.txCounter = nextCounter(r.txCounter, now)
+	b := append(r.deliverBuf[:0], 'M', 'S', 'S', 'T', protocolVersion, typSecureDiscoveryDeliver, flags)
+	b = binary.BigEndian.AppendUint64(b, senderID)
+	b = binary.BigEndian.AppendUint64(b, 0) // dst_id, set per recipient
+	b = binary.BigEndian.AppendUint64(b, r.txCounter)
+	return append(b, ipPkt...)
+}
+
+// sealDeliver sets the recipient and appends its tag. msg must come from
+// buildDeliver; the returned slice is valid until the next call.
+func (r *relay) sealDeliver(msg []byte, dstID uint64, keys *sdiscKeys) []byte {
+	binary.BigEndian.PutUint64(msg[15:23], dstID)
+	var tag [sdiscTagLen]byte
+	sdiscTag(&keys.r2c, msg, &tag)
+	return append(msg, tag[:]...)
 }
 
 // send hands b to the kernel. A send error does not invalidate the binding:
@@ -343,6 +518,9 @@ func (r *relay) maintain(now time.Time) {
 		r.discSessions.sweep(now)
 		r.discSender.sweep(now)
 		r.discDedup.sweep(now)
+		if r.discReplay != nil {
+			r.discReplay.sweep(now)
+		}
 		r.stats.discoverySessions.Store(int64(r.discSessions.len()))
 	}
 	if rc, ok := r.rooms.(*roomCache); ok && rc != nil {

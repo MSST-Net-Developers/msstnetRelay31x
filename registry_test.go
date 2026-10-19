@@ -14,13 +14,13 @@ func TestRegistryLifecycle(t *testing.T) {
 	r := newRegistry(10, time.Minute)
 	a, b := ap("198.51.100.1:5000"), ap("198.51.100.2:6000")
 
-	if got := r.register(1, a, t0); got != regNew {
+	if got := r.register(1, a, t0, false); got != regNew {
 		t.Fatalf("first register = %v", got)
 	}
-	if got := r.register(1, a, t0.Add(time.Second)); got != regRefreshed {
+	if got := r.register(1, a, t0.Add(time.Second), false); got != regRefreshed {
 		t.Fatalf("refresh = %v", got)
 	}
-	if got := r.register(1, b, t0.Add(2*time.Second)); got != regRebound {
+	if got := r.register(1, b, t0.Add(2*time.Second), false); got != regRebound {
 		t.Fatalf("rebind = %v", got)
 	}
 	if addr, ok := r.lookup(1, t0.Add(3*time.Second)); !ok || addr != b {
@@ -35,7 +35,7 @@ func TestRegistryLifecycle(t *testing.T) {
 	if _, ok := r.lookup(1, exp); ok {
 		t.Fatal("expired binding returned")
 	}
-	if got := r.register(1, b, exp); got != regNew {
+	if got := r.register(1, b, exp, false); got != regNew {
 		t.Fatalf("register after expiry = %v, want regNew", got)
 	}
 	if n := r.sweep(exp.Add(time.Minute)); n != 1 || r.len() != 0 {
@@ -50,22 +50,22 @@ func TestRegistryLifecycle(t *testing.T) {
 func TestRegistryCapacity(t *testing.T) {
 	r := newRegistry(2, time.Minute)
 	a := ap("198.51.100.1:5000")
-	r.register(1, a, t0)
-	r.register(2, a, t0)
-	if got := r.register(3, a, t0); got != regFull {
+	r.register(1, a, t0, false)
+	r.register(2, a, t0, false)
+	if got := r.register(3, a, t0, false); got != regFull {
 		t.Fatalf("over capacity = %v", got)
 	}
 	// Existing entries can still refresh when full.
-	if got := r.register(1, a, t0.Add(time.Second)); got != regRefreshed {
+	if got := r.register(1, a, t0.Add(time.Second), false); got != regRefreshed {
 		t.Fatalf("refresh when full = %v", got)
 	}
 	// An expired-but-unswept entry can be reclaimed by its own ID.
-	if got := r.register(2, a, t0.Add(2*time.Minute)); got != regNew {
+	if got := r.register(2, a, t0.Add(2*time.Minute), false); got != regNew {
 		t.Fatalf("reclaim expired = %v", got)
 	}
 	// After sweeping, new IDs fit again.
 	r.sweep(t0.Add(3 * time.Minute))
-	if got := r.register(3, a, t0.Add(3*time.Minute)); got != regNew {
+	if got := r.register(3, a, t0.Add(3*time.Minute), false); got != regNew {
 		t.Fatalf("after sweep = %v", got)
 	}
 }
@@ -73,17 +73,17 @@ func TestRegistryCapacity(t *testing.T) {
 func TestRegistryRejectsInvalidAddr(t *testing.T) {
 	r := newRegistry(10, time.Minute)
 	for _, s := range []string{"0.0.0.0:1", "[::]:1", "198.51.100.1:0", "224.0.0.251:5353", "255.255.255.255:9", "[::ffff:0.0.0.0]:1", "[ff02::1]:1"} {
-		if got := r.register(1, ap(s), t0); got != regInvalidAddr {
+		if got := r.register(1, ap(s), t0, false); got != regInvalidAddr {
 			t.Errorf("%s: %v", s, got)
 		}
 	}
 	if r.len() != 0 {
 		t.Fatal("invalid address stored")
 	}
-	if got := r.register(1, ap("[2001:db8::1]:21031"), t0); got != regNew {
+	if got := r.register(1, ap("[2001:db8::1]:21031"), t0, false); got != regNew {
 		t.Fatalf("ipv6 rejected: %v", got)
 	}
-	if got := r.register(2, ap("[::ffff:198.51.100.1]:21031"), t0); got != regNew {
+	if got := r.register(2, ap("[::ffff:198.51.100.1]:21031"), t0, false); got != regNew {
 		t.Fatalf("v4-mapped rejected: %v", got)
 	}
 }

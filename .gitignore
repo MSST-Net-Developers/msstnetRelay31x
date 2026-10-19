@@ -21,3 +21,7 @@ Thumbs.db
 .env*
 config.yaml
 config.yml
+
+# Relay secure-discovery private key
+relay_discovery.key
+*.key

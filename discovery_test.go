@@ -34,8 +34,8 @@ func TestCoordinatorPeerFetcher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ids) != 2 || ids[0] != 0xa1b2c3d4 || ids[1] != 1 {
-		t.Fatalf("ids = %x", ids)
+	if len(ids) != 2 || ids[0].id != 0xa1b2c3d4 || ids[1].id != 1 || ids[0].hasPub {
+		t.Fatalf("ids = %+v", ids)
 	}
 	if p := gotPath.Load(); p != "/room/space-0a1b2c3d/discovery-peers" {
 		t.Fatalf("path = %v", p)
@@ -69,22 +69,22 @@ func TestCoordinatorPeerFetcherBodyLimit(t *testing.T) {
 
 func TestRoomCacheAsyncRefresh(t *testing.T) {
 	var calls atomic.Int32
-	result := []uint64{1, 2}
+	result := []peerRecord{{id: 1}, {id: 2}}
 	var fail atomic.Bool
-	fetch := func(ctx context.Context, roomID string) ([]uint64, error) {
+	fetch := func(ctx context.Context, roomID string) ([]peerRecord, error) {
 		calls.Add(1)
 		if fail.Load() {
 			return nil, errors.New("down")
 		}
 		return result, nil
 	}
-	c := newRoomCache(fetch, 10, 5*time.Second, 30*time.Second)
+	c := newRoomCache(fetch, nil, 10, 5*time.Second, 30*time.Second)
 	drain := func(now time.Time) {
 		for {
 			select {
 			case id := <-c.queue:
-				ids, err := c.fetch(context.Background(), id)
-				c.complete(id, ids, err, now)
+				recs, err := c.fetch(context.Background(), id)
+				c.complete(id, c.prepare(id, recs), err, now)
 			default:
 				return
 			}
@@ -131,7 +131,7 @@ func TestRoomCacheAsyncRefresh(t *testing.T) {
 }
 
 func TestRoomCacheBounds(t *testing.T) {
-	c := newRoomCache(func(context.Context, string) ([]uint64, error) { return nil, nil }, 3, time.Second, 10*time.Second)
+	c := newRoomCache(func(context.Context, string) ([]peerRecord, error) { return nil, nil }, nil, 3, time.Second, 10*time.Second)
 	for i := range 10 {
 		c.peers(fmt.Appendf(nil, "room-%d", i), t0)
 	}
@@ -140,7 +140,7 @@ func TestRoomCacheBounds(t *testing.T) {
 	}
 
 	// Fetch budget: many distinct rooms cannot flood the Coordinator.
-	c = newRoomCache(func(context.Context, string) ([]uint64, error) { return nil, nil }, 1000, time.Second, 10*time.Second)
+	c = newRoomCache(func(context.Context, string) ([]peerRecord, error) { return nil, nil }, nil, 1000, time.Second, 10*time.Second)
 	for i := range 500 {
 		c.peers(fmt.Appendf(nil, "room-%d", i), t0)
 	}
@@ -150,10 +150,10 @@ func TestRoomCacheBounds(t *testing.T) {
 }
 
 func TestRoomCacheConcurrent(t *testing.T) {
-	fetch := func(ctx context.Context, roomID string) ([]uint64, error) {
-		return []uint64{1, 2, 3}, nil
+	fetch := func(ctx context.Context, roomID string) ([]peerRecord, error) {
+		return []peerRecord{{id: 1}, {id: 2}, {id: 3}}, nil
 	}
-	c := newRoomCache(fetch, 100, time.Millisecond, time.Second)
+	c := newRoomCache(fetch, nil, 100, time.Millisecond, time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	for range roomFetchWorkers {

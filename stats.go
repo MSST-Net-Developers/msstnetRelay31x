@@ -38,6 +38,11 @@ type stats struct {
 	dropRoomUnknown   atomic.Uint64 // discovery: room peers not (yet) known
 	dropNotInRoom     atomic.Uint64 // discovery: sender not registered in room
 
+	// Secure discovery.
+	dropAuthFailed      atomic.Uint64 // no key for the claimed sender, or bad tag
+	dropReplay          atomic.Uint64 // counter stale or not increasing
+	dropUnauthenticated atomic.Uint64 // legacy discovery refused (required mode, or ID bound securely)
+
 	sessions          atomic.Int64 // gauge
 	discoverySessions atomic.Int64 // gauge
 }
@@ -45,13 +50,14 @@ type stats struct {
 func (s *stats) report() {
 	log.Printf("stats: sessions=%d discovery_sessions=%d rx=%d data_fwd=%d probe_fwd=%d ping_echo=%d disc_fwd=%d "+
 		"send_err=%d reg_new=%d rebind=%d reg_full=%d reg_invalid=%d "+
-		"drop{malformed=%d version=%d type=%d unknown_dst=%d unverified_src=%d loop=%d rate=%d dup=%d room_unknown=%d not_in_room=%d}",
+		"drop{malformed=%d version=%d type=%d unknown_dst=%d unverified_src=%d loop=%d rate=%d dup=%d room_unknown=%d not_in_room=%d auth=%d replay=%d unauth=%d}",
 		s.sessions.Load(), s.discoverySessions.Load(), s.rxPackets.Load(),
 		s.dataForwarded.Load(), s.probesForwarded.Load(), s.pingsEchoed.Load(), s.discoveryForwarded.Load(),
 		s.sendErrors.Load(), s.registrations.Load(), s.rebinds.Load(), s.sessionsFull.Load(), s.invalidRegistrant.Load(),
 		s.dropMalformed.Load(), s.dropVersion.Load(), s.dropUnknownType.Load(), s.dropUnknownDst.Load(),
 		s.dropUnverifiedSrc.Load(), s.dropLoop.Load(), s.dropRateLimited.Load(), s.dropDuplicate.Load(),
-		s.dropRoomUnknown.Load(), s.dropNotInRoom.Load())
+		s.dropRoomUnknown.Load(), s.dropNotInRoom.Load(),
+		s.dropAuthFailed.Load(), s.dropReplay.Load(), s.dropUnauthenticated.Load())
 }
 
 // runReporter logs a stats line every interval until ctx is cancelled.

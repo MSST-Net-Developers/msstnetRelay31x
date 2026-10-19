@@ -23,6 +23,7 @@ processing (preserves per-flow ordering). Header: `"MSST"|ver=1|type|flags|src_i
 | 0x07 p2p pong | forward datagram unchanged to `dst_id` | dst registered; dst ≠ src; payload ≥ 12; global rate limit |
 | 0x08 discovery register | bind `src_id` → discovery address | as register, separate table |
 | 0x09 discovery data | send bare IPv4 packet to other discovery peers of the room | see below |
+| 0x0A / 0x0B secure discovery register / data | as 0x08 / 0x09, authenticated | only when `discovery.auth` ≠ `off`; see [SECURE_DISCOVERY.md](SECURE_DISCOVERY.md) |
 
 Version ≠ 1, bad magic, truncated and unknown types are dropped and counted.
 
@@ -34,6 +35,12 @@ be in that list (`require_sender_in_room`) → fan-out capped by `max_fanout` an
 the global egress budget. Only peers registered at *this* relay receive
 packets (as in 3.0.x). On a room-cache miss the packet is dropped while the
 list is fetched; games re-broadcast periodically.
+
+**Secure discovery** (`discovery.auth: optional|required`, default `off`):
+clients authenticate 0x0A/0x0B with a MAC key derived from their X25519
+identity key and the relay's key. Relay→client delivery is then 0x0C,
+authenticated with a per-recipient key. Needs Coordinator and client changes
+that are not implemented yet; see [SECURE_DISCOVERY.md](SECURE_DISCOVERY.md).
 
 ## Trust model (what is and is not verified)
 
@@ -49,17 +56,21 @@ protection**. `src_id` is a claim. Consequently:
   Whether payloads are end-to-end encrypted is decided by the client, not the
   relay (client 3.0.x sends raw IP packets in DATA).
 
-Fixing this requires a protocol change (e.g. Coordinator-issued relay tokens
-or client-key-signed registrations) coordinated across client, Coordinator
-and relay.
+Fixing this requires a protocol change coordinated across client, Coordinator
+and relay. Secure discovery (SECURE_DISCOVERY.md) does this for the discovery
+path only. It depends on the Coordinator binding public keys to device IDs,
+which Coordinator 3.1.x does not do yet. The data, register and probe paths
+are unchanged.
 
 ## Coordinator interface
 
-- `POST /relay/register {id,region,addr}`, `POST /relay/heartbeat {id}` every
+- `POST /relay/register {id,region,addr[,pub_key]}` (`pub_key` only with
+  secure discovery), `POST /relay/heartbeat {id}` every
   `heartbeat_interval` (10 s; Coordinator expires relays after 30 s), with
   `X-Relay-Secret: <control.relay_secret>` when set. 401 → secret mismatch;
   404 on heartbeat → re-register. Backoff 5 s → 5 min with jitter.
 - `GET /room/{id}/discovery-peers` (unauthenticated on Coordinator 3.1.x).
+  Each item's optional `pub_key` is used for secure discovery.
 - Forwarding never depends on the Coordinator being reachable.
 
 ## Configuration and limits
@@ -80,6 +91,9 @@ are rejected. A 3.0.x `config.yaml` loads unchanged; add
 | `discovery.egress_rate/burst` | 20000/40000 | global, counts each recipient |
 | `discovery.max_fanout` | 256 | recipients per packet |
 | `discovery.room_cache_*` | 5s / 30s / 4096 | refresh / serve-stale / rooms |
+| `discovery.auth` | off | `off` / `optional` / `required` |
+| `discovery.auth_key_file` | relay_discovery.key | relay X25519 key, created 0600 |
+| `discovery.auth_max_clock_skew` | 30s | counter freshness; `session_ttl` must be ≥ 2× |
 | `log.stats_interval` | 60s | counters line; 0 disables |
 
 Coordinator lookups are additionally limited to 10/s (burst 20) and 2

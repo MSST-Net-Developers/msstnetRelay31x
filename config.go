@@ -83,7 +83,22 @@ type DiscoveryConfig struct {
 	MaxFanout int `yaml:"max_fanout"`
 	// RequireSenderInRoom forwards only if the sender is itself listed in the
 	// room's discovery peers on the Coordinator (i.e. it did discovery_join).
+	// Applies to legacy packets; authenticated ones always require it.
 	RequireSenderInRoom bool `yaml:"require_sender_in_room"`
+
+	// Auth selects secure discovery (SECURE_DISCOVERY.md): "off" (3.0.x
+	// behaviour), "optional" (authenticated and legacy clients; legacy
+	// packets cannot override an authenticated device's binding) or
+	// "required" (legacy discovery packets are dropped).
+	Auth string `yaml:"auth"`
+	// AuthKeyFile holds the relay's X25519 private key (base64); created
+	// with mode 0600 if missing. Its public key is reported to the
+	// Coordinator as pub_key.
+	AuthKeyFile string `yaml:"auth_key_file"`
+	// AuthMaxClockSkew bounds |client clock - relay clock| for packet
+	// counters, and thereby how long a packet can be replayed after a relay
+	// restart.
+	AuthMaxClockSkew time.Duration `yaml:"auth_max_clock_skew"`
 }
 
 type ControlConfig struct {
@@ -133,6 +148,9 @@ func defaultConfig() *Config {
 			RoomCacheMaxEntries: 4096,
 			MaxFanout:           256,
 			RequireSenderInRoom: true,
+			Auth:                "off",
+			AuthKeyFile:         "relay_discovery.key",
+			AuthMaxClockSkew:    30 * time.Second,
 		},
 		Control: ControlConfig{
 			HeartbeatInterval: 10 * time.Second, // Coordinator expires relays after 30 s
@@ -233,6 +251,20 @@ func (c *Config) validate() error {
 	if c.Discovery.SessionTTL < 26*time.Second {
 		bad("discovery.session_ttl must exceed the client's discovery registration interval (25s)")
 	}
+	if mode, err := parseAuthMode(c.Discovery.Auth); err != nil {
+		bad("discovery.auth: %v", err)
+	} else if mode != authOff && c.Discovery.Enabled {
+		if c.Discovery.AuthKeyFile == "" {
+			bad("discovery.auth_key_file is required when discovery.auth is %s", c.Discovery.Auth)
+		}
+		if c.Discovery.AuthMaxClockSkew <= 0 {
+			bad("discovery.auth_max_clock_skew must be > 0")
+		}
+		// The replay window must outlive any packet that is still fresh.
+		if c.Discovery.SessionTTL < 2*c.Discovery.AuthMaxClockSkew {
+			bad("discovery.session_ttl must be >= 2 * discovery.auth_max_clock_skew")
+		}
+	}
 	if c.Log.StatsInterval < 0 {
 		bad("log.stats_interval must be >= 0")
 	}
@@ -249,6 +281,16 @@ func (c *Config) validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// authMode returns the effective secure-discovery mode (off when discovery
+// is disabled). Call after validate.
+func (c *Config) authMode() authMode {
+	m, _ := parseAuthMode(c.Discovery.Auth)
+	if !c.Discovery.Enabled {
+		return authOff
+	}
+	return m
 }
 
 func (c *Config) limits() relayLimits {
@@ -273,6 +315,8 @@ func (c *Config) limits() relayLimits {
 		discDedupMax:        c.Discovery.DedupMaxEntries,
 		discMaxFanout:       c.Discovery.MaxFanout,
 		discRequireSenderIn: c.Discovery.RequireSenderInRoom,
+		discAuth:            c.authMode(),
+		discAuthSkew:        c.Discovery.AuthMaxClockSkew,
 		maintenanceInterval: 5 * time.Second,
 	}
 }

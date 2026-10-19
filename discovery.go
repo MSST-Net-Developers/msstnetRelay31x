@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,11 @@ import (
 // the read loop only consults roomCache; misses are fetched by a bounded set of
 // background workers and the triggering packet is dropped. Games re-broadcast
 // discovery packets periodically, so the next one is forwarded.
+//
+// With secure discovery enabled the Coordinator response also carries each
+// peer's X25519 public key; the workers derive the per-device MAC keys (the
+// only asymmetric operation) and store them with the peer list, so the read
+// loop does only HMAC.
 
 const (
 	maxPeersResponseBytes = 1 << 20
@@ -45,11 +51,24 @@ const (
 // roomPeerLookup is what the read loop needs from the room cache.
 type roomPeerLookup interface {
 	// peers returns the cached discovery peer list for roomID. ok is false
-	// when no usable list is available yet.
-	peers(roomID []byte, now time.Time) (ids []uint64, ok bool)
+	// when no usable list is available yet. The slice is immutable.
+	peers(roomID []byte, now time.Time) (list []discPeer, ok bool)
 }
 
-type peerFetcher func(ctx context.Context, roomID string) ([]uint64, error)
+// discPeer is one discovery participant of a room.
+type discPeer struct {
+	id   uint64
+	keys *sdiscKeys // nil: auth off, or no usable public key for this device
+}
+
+// peerRecord is a peer as reported by the Coordinator.
+type peerRecord struct {
+	id     uint64
+	pub    [32]byte
+	hasPub bool
+}
+
+type peerFetcher func(ctx context.Context, roomID string) ([]peerRecord, error)
 
 // roomCache is shared between the read loop (lookups) and fetch workers
 // (updates), so it is guarded by mu. No I/O happens while mu is held.
@@ -62,18 +81,20 @@ type roomCache struct {
 	queue      chan string
 	fetch      peerFetcher
 	fetchLimit *tokenBucket
-	full       bool // last insert was refused; logged once per transition
+	auth       *sdiscAuth // nil: secure discovery off, no keys derived
+	full       bool       // last insert was refused; logged once per transition
 }
 
 type roomEntry struct {
-	peers      []uint64 // immutable once stored; replaced wholesale
+	peers      []discPeer // immutable once stored; replaced wholesale
 	fetchedAt  time.Time
 	attemptAt  time.Time
 	refreshing bool
 }
 
-func newRoomCache(fetch peerFetcher, maxEntries int, ttl, staleTTL time.Duration) *roomCache {
+func newRoomCache(fetch peerFetcher, auth *sdiscAuth, maxEntries int, ttl, staleTTL time.Duration) *roomCache {
 	return &roomCache{
+		auth:       auth,
 		entries:    make(map[string]*roomEntry),
 		maxEntries: maxEntries,
 		ttl:        ttl,
@@ -84,7 +105,7 @@ func newRoomCache(fetch peerFetcher, maxEntries int, ttl, staleTTL time.Duration
 	}
 }
 
-func (c *roomCache) peers(roomID []byte, now time.Time) ([]uint64, bool) {
+func (c *roomCache) peers(roomID []byte, now time.Time) ([]discPeer, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -122,14 +143,62 @@ func (c *roomCache) run(ctx context.Context, timeout time.Duration) {
 			return
 		case roomID := <-c.queue:
 			fctx, cancel := context.WithTimeout(ctx, timeout)
-			ids, err := c.fetch(fctx, roomID)
+			recs, err := c.fetch(fctx, roomID)
 			cancel()
-			c.complete(roomID, ids, err, time.Now())
+			var list []discPeer
+			if err == nil {
+				list = c.prepare(roomID, recs)
+			}
+			c.complete(roomID, list, err, time.Now())
 		}
 	}
 }
 
-func (c *roomCache) complete(roomID string, ids []uint64, err error, now time.Time) {
+// prepare converts fetched records into a peer list, deriving MAC keys.
+// Keys from the room's current list are reused when the public key is
+// unchanged, so steady-state refreshes do no X25519 work. Runs in a worker;
+// mu is held only to read the current list.
+func (c *roomCache) prepare(roomID string, recs []peerRecord) []discPeer {
+	list := make([]discPeer, 0, len(recs))
+	if c.auth == nil {
+		for _, r := range recs {
+			list = append(list, discPeer{id: r.id})
+		}
+		return list
+	}
+	c.mu.Lock()
+	var prev []discPeer
+	if e, ok := c.entries[roomID]; ok {
+		prev = e.peers
+	}
+	c.mu.Unlock()
+	old := make(map[uint64]*sdiscKeys, len(prev))
+	for _, p := range prev {
+		if p.keys != nil {
+			old[p.id] = p.keys
+		}
+	}
+	bad := 0
+	for _, r := range recs {
+		p := discPeer{id: r.id}
+		if r.hasPub {
+			if k := old[r.id]; k != nil && k.pub == r.pub {
+				p.keys = k
+			} else if k, err := c.auth.derive(r.id, r.pub); err == nil {
+				p.keys = k
+			} else {
+				bad++
+			}
+		}
+		list = append(list, p)
+	}
+	if bad > 0 {
+		log.Printf("discovery: room %s: %d peer public keys rejected", roomID, bad)
+	}
+	return list
+}
+
+func (c *roomCache) complete(roomID string, list []discPeer, err error, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[roomID]
@@ -145,10 +214,10 @@ func (c *roomCache) complete(roomID string, ids []uint64, err error, now time.Ti
 		}
 		return
 	}
-	if ids == nil {
-		ids = []uint64{}
+	if list == nil {
+		list = []discPeer{}
 	}
-	e.peers = ids
+	e.peers = list
 	e.fetchedAt = now
 }
 
@@ -166,9 +235,12 @@ func (c *roomCache) sweep(now time.Time) {
 // coordinatorPeerFetcher returns a peerFetcher that queries
 // GET {base}/room/{roomID}/discovery-peers. Response shape (Coordinator
 // room.go handleDiscoveryPeers): [{"device_id":"device-xxxxxxxx", ...}, ...].
+// For secure discovery each item also needs "pub_key" (base64 X25519, as in
+// device registration); Coordinator 3.1.x does not send it yet, and peers
+// without a valid key cannot use authenticated discovery.
 func coordinatorPeerFetcher(base string, client *http.Client) peerFetcher {
 	base = strings.TrimRight(base, "/")
-	return func(ctx context.Context, roomID string) ([]uint64, error) {
+	return func(ctx context.Context, roomID string) ([]peerRecord, error) {
 		if !validRoomID(roomID) {
 			return nil, fmt.Errorf("invalid room id")
 		}
@@ -188,6 +260,7 @@ func coordinatorPeerFetcher(base string, client *http.Client) peerFetcher {
 		}
 		var items []struct {
 			DeviceID string `json:"device_id"`
+			PubKey   string `json:"pub_key"`
 		}
 		dec := json.NewDecoder(io.LimitReader(resp.Body, maxPeersResponseBytes))
 		if err := dec.Decode(&items); err != nil {
@@ -196,13 +269,20 @@ func coordinatorPeerFetcher(base string, client *http.Client) peerFetcher {
 		if len(items) > maxPeersPerRoom {
 			items = items[:maxPeersPerRoom]
 		}
-		ids := make([]uint64, 0, len(items))
+		recs := make([]peerRecord, 0, len(items))
 		for _, it := range items {
-			if id, ok := parseDeviceID(it.DeviceID); ok {
-				ids = append(ids, id)
+			id, ok := parseDeviceID(it.DeviceID)
+			if !ok {
+				continue
 			}
+			r := peerRecord{id: id}
+			if pub, err := base64.StdEncoding.DecodeString(it.PubKey); err == nil && len(pub) == 32 {
+				r.pub = [32]byte(pub)
+				r.hasPub = true
+			}
+			recs = append(recs, r)
 		}
-		return ids, nil
+		return recs, nil
 	}
 }
 

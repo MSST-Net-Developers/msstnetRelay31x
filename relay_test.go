@@ -28,11 +28,19 @@ func (w *fakeWriter) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, err
 
 func (w *fakeWriter) take() []sent { o := w.out; w.out = nil; return o }
 
+// fakeRooms lists room members without keys (legacy Coordinator).
 type fakeRooms map[string][]uint64
 
-func (f fakeRooms) peers(roomID []byte, _ time.Time) ([]uint64, bool) {
-	p, ok := f[string(roomID)]
-	return p, ok
+func (f fakeRooms) peers(roomID []byte, _ time.Time) ([]discPeer, bool) {
+	ids, ok := f[string(roomID)]
+	if !ok {
+		return nil, false
+	}
+	list := make([]discPeer, len(ids))
+	for i, id := range ids {
+		list[i] = discPeer{id: id}
+	}
+	return list, true
 }
 
 func testLimits() relayLimits {

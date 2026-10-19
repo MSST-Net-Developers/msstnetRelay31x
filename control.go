@@ -26,6 +26,7 @@ type controlClient struct {
 	region    string
 	addr      string
 	secret    string
+	pubKey    string // secure-discovery public key (base64); empty when off
 	interval  time.Duration
 	http      *http.Client
 
@@ -83,11 +84,17 @@ func (c *controlClient) post(ctx context.Context, path string, body any) error {
 }
 
 func (c *controlClient) register(ctx context.Context) error {
-	return c.post(ctx, "/relay/register", map[string]string{
+	body := map[string]string{
 		"id":     c.id,
 		"region": c.region,
 		"addr":   c.addr,
-	})
+	}
+	// Coordinator 3.1.x ignores unknown fields; clients need this key (via
+	// GET /relays) to use secure discovery with this relay.
+	if c.pubKey != "" {
+		body["pub_key"] = c.pubKey
+	}
+	return c.post(ctx, "/relay/register", body)
 }
 
 func (c *controlClient) heartbeat(ctx context.Context) error {

@@ -53,14 +53,27 @@ func main() {
 	var wg sync.WaitGroup
 	st := &stats{}
 
+	var auth *sdiscAuth
+	if cfg.authMode() != authOff {
+		priv, err := loadOrCreateRelayKey(cfg.Discovery.AuthKeyFile)
+		if err != nil {
+			log.Fatalf("discovery auth key: %v", err)
+		}
+		auth = newSdiscAuth(priv)
+		log.Printf("discovery: auth=%s relay public key %s", cfg.Discovery.Auth, auth.publicKeyBase64())
+	}
+
 	var rooms roomPeerLookup
 	if cfg.Control.ServerURL != "" {
 		cc := newControlClient(cfg)
+		if auth != nil {
+			cc.pubKey = auth.publicKeyBase64()
+		}
 		wg.Go(func() { cc.run(ctx) })
 
 		if cfg.Discovery.Enabled {
 			httpc := &http.Client{Timeout: 3 * time.Second}
-			rc := newRoomCache(coordinatorPeerFetcher(cfg.Control.ServerURL, httpc),
+			rc := newRoomCache(coordinatorPeerFetcher(cfg.Control.ServerURL, httpc), auth,
 				cfg.Discovery.RoomCacheMaxEntries, cfg.Discovery.RoomCacheTTL, cfg.Discovery.RoomCacheStaleTTL)
 			for range roomFetchWorkers {
 				wg.Go(func() { rc.run(ctx, 3*time.Second) })
