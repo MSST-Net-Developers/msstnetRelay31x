@@ -45,36 +45,15 @@ const (
 	sdiscTagLen     = 16
 	sdiscLabel      = "msst-sdisc-v1"
 
-	// sdiscFlagSenderVerified is set in the header flags of a 0x0C packet
-	// when the relay authenticated the original sender (src_id). It is clear
-	// for packets from legacy (0x09) senders in optional mode.
+	// sdiscFlagSenderVerified is set in the header flags of every 0x0C
+	// packet: the relay authenticated the original sender (src_id). 3.1.x
+	// clients drop 0x0C without it.
 	sdiscFlagSenderVerified = 0x01
 
 	// sdiscCounterShift: counters are unix_ms<<16 | sequence, so both sides
 	// can check freshness without persisting state across restarts.
 	sdiscCounterShift = 16
 )
-
-// authMode selects how discovery packets are authenticated.
-type authMode uint8
-
-const (
-	authOff      authMode = iota // 0x0A–0x0C unsupported; 3.0.x behaviour
-	authOptional                 // both; legacy cannot override an authenticated binding
-	authRequired                 // legacy 0x08/0x09 dropped
-)
-
-func parseAuthMode(s string) (authMode, error) {
-	switch s {
-	case "off", "":
-		return authOff, nil
-	case "optional":
-		return authOptional, nil
-	case "required":
-		return authRequired, nil
-	}
-	return 0, fmt.Errorf("unknown mode %q (want off, optional or required)", s)
-}
 
 // sdiscAuth is the relay's static X25519 key.
 type sdiscAuth struct {

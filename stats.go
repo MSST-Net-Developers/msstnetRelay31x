@@ -20,7 +20,7 @@ type stats struct {
 
 	// Forwarding. "forwarded" means handed to the kernel socket; UDP gives no
 	// delivery guarantee beyond that.
-	dataForwarded      atomic.Uint64
+	dataForwarded      atomic.Uint64 // WireGuard (0x0D) frames
 	probesForwarded    atomic.Uint64 // P2P ping/pong
 	pingsEchoed        atomic.Uint64
 	discoveryForwarded atomic.Uint64 // per-recipient datagrams
@@ -30,6 +30,7 @@ type stats struct {
 	dropMalformed     atomic.Uint64 // framing / field validation
 	dropVersion       atomic.Uint64
 	dropUnknownType   atomic.Uint64
+	dropRetired       atomic.Uint64 // 3.0.x types 0x04/0x08/0x09
 	dropUnknownDst    atomic.Uint64 // destination not registered or expired
 	dropUnverifiedSrc atomic.Uint64 // P2P ping whose src_id is not bound to its source address
 	dropLoop          atomic.Uint64 // destination equals source
@@ -39,9 +40,8 @@ type stats struct {
 	dropNotInRoom     atomic.Uint64 // discovery: sender not registered in room
 
 	// Secure discovery.
-	dropAuthFailed      atomic.Uint64 // no key for the claimed sender, or bad tag
-	dropReplay          atomic.Uint64 // counter stale or not increasing
-	dropUnauthenticated atomic.Uint64 // legacy discovery refused (required mode, or ID bound securely)
+	dropAuthFailed atomic.Uint64 // no key for the claimed sender, or bad tag
+	dropReplay     atomic.Uint64 // counter stale or not increasing
 
 	sessions          atomic.Int64 // gauge
 	discoverySessions atomic.Int64 // gauge
@@ -50,14 +50,14 @@ type stats struct {
 func (s *stats) report() {
 	log.Printf("stats: sessions=%d discovery_sessions=%d rx=%d data_fwd=%d probe_fwd=%d ping_echo=%d disc_fwd=%d "+
 		"send_err=%d reg_new=%d rebind=%d reg_full=%d reg_invalid=%d "+
-		"drop{malformed=%d version=%d type=%d unknown_dst=%d unverified_src=%d loop=%d rate=%d dup=%d room_unknown=%d not_in_room=%d auth=%d replay=%d unauth=%d}",
+		"drop{malformed=%d version=%d type=%d retired=%d unknown_dst=%d unverified_src=%d loop=%d rate=%d dup=%d room_unknown=%d not_in_room=%d auth=%d replay=%d}",
 		s.sessions.Load(), s.discoverySessions.Load(), s.rxPackets.Load(),
 		s.dataForwarded.Load(), s.probesForwarded.Load(), s.pingsEchoed.Load(), s.discoveryForwarded.Load(),
 		s.sendErrors.Load(), s.registrations.Load(), s.rebinds.Load(), s.sessionsFull.Load(), s.invalidRegistrant.Load(),
-		s.dropMalformed.Load(), s.dropVersion.Load(), s.dropUnknownType.Load(), s.dropUnknownDst.Load(),
+		s.dropMalformed.Load(), s.dropVersion.Load(), s.dropUnknownType.Load(), s.dropRetired.Load(), s.dropUnknownDst.Load(),
 		s.dropUnverifiedSrc.Load(), s.dropLoop.Load(), s.dropRateLimited.Load(), s.dropDuplicate.Load(),
 		s.dropRoomUnknown.Load(), s.dropNotInRoom.Load(),
-		s.dropAuthFailed.Load(), s.dropReplay.Load(), s.dropUnauthenticated.Load())
+		s.dropAuthFailed.Load(), s.dropReplay.Load())
 }
 
 // runReporter logs a stats line every interval until ctx is cancelled.

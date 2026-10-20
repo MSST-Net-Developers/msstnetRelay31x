@@ -54,13 +54,16 @@ func main() {
 	st := &stats{}
 
 	var auth *sdiscAuth
-	if cfg.authMode() != authOff {
+	if cfg.Discovery.Enabled {
 		priv, err := loadOrCreateRelayKey(cfg.Discovery.AuthKeyFile)
 		if err != nil {
 			log.Fatalf("discovery auth key: %v", err)
 		}
 		auth = newSdiscAuth(priv)
-		log.Printf("discovery: auth=%s relay public key %s", cfg.Discovery.Auth, auth.publicKeyBase64())
+		log.Printf("discovery: secure discovery (required), relay public key %s", auth.publicKeyBase64())
+		if !cfg.Discovery.RequireSenderInRoom {
+			log.Printf("discovery: require_sender_in_room is deprecated and ignored; senders must always be room members")
+		}
 	}
 
 	var rooms roomPeerLookup
@@ -73,7 +76,7 @@ func main() {
 
 		if cfg.Discovery.Enabled {
 			httpc := &http.Client{Timeout: 3 * time.Second}
-			rc := newRoomCache(coordinatorPeerFetcher(cfg.Control.ServerURL, httpc), auth,
+			rc := newRoomCache(coordinatorPeerFetcher(cfg.Control.ServerURL, cfg.Control.RelaySecret, httpc), auth,
 				cfg.Discovery.RoomCacheMaxEntries, cfg.Discovery.RoomCacheTTL, cfg.Discovery.RoomCacheStaleTTL)
 			for range roomFetchWorkers {
 				wg.Go(func() { rc.run(ctx, 3*time.Second) })

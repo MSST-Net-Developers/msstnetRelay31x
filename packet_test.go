@@ -32,12 +32,12 @@ func discoveryPayload(room string, ip []byte) []byte {
 }
 
 func TestParsePacket(t *testing.T) {
-	raw := encodePacket(typData, 0xa1b2c3d4, 0x01020304, []byte{0x45, 1, 2})
+	raw := encodePacket(typWireGuard, 0xa1b2c3d4, 0x01020304, []byte{0x45, 1, 2})
 	p, err := parsePacket(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.typ != typData || p.srcID != 0xa1b2c3d4 || p.dstID != 0x01020304 {
+	if p.typ != typWireGuard || p.srcID != 0xa1b2c3d4 || p.dstID != 0x01020304 {
 		t.Fatalf("bad header: %+v", p)
 	}
 	if !bytes.Equal(p.payload, []byte{0x45, 1, 2}) || len(p.raw) != len(raw) {
@@ -51,7 +51,7 @@ func TestParsePacket(t *testing.T) {
 }
 
 func TestParsePacketRejects(t *testing.T) {
-	good := encodePacket(typData, 1, 2, []byte{0x45})
+	good := encodePacket(typWireGuard, 1, 2, []byte{0x45})
 	badMagic := bytes.Clone(good)
 	badMagic[3] = 'X'
 	badVersion := bytes.Clone(good)
@@ -125,7 +125,7 @@ func TestParseDeviceID(t *testing.T) {
 }
 
 func BenchmarkParsePacket(b *testing.B) {
-	raw := encodePacket(typData, 1, 2, make([]byte, 1400))
+	raw := encodePacket(typWireGuard, 1, 2, make([]byte, 1400))
 	b.ReportAllocs()
 	for b.Loop() {
 		if _, err := parsePacket(raw); err != nil {

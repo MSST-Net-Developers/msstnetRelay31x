@@ -2,19 +2,20 @@
 
 Sender authentication for the game-discovery proxy, using each device's
 existing X25519 identity key (the WireGuard key in `private.key`). Relay side
-implemented in `sdisc.go`; client and Coordinator changes are listed below
-and are **not implemented yet**.
+implemented in `sdisc.go`. It is the only discovery protocol in 3.1.x:
+unauthenticated 0x08/0x09 and bare-IPv4 delivery are retired (client
+contract: `msst-net-core-31x/docs/RELAY_REQUIREMENTS_3.1.md`).
 
 ## Goals and non-goals
 
-Prevents, for clients that use it:
+Prevents:
 
 - injecting discovery packets into a room under another device's ID;
 - hijacking another device's discovery address (and so receiving its
   discovery traffic) with a spoofed register;
 - replaying captured packets (outside the window described under Replay);
 - injecting packets straight into a client's UDP 21032 socket, bypassing the
-  relay (requires the client to accept only verified 0x0C there).
+  relay (3.1.x clients accept only verified 0x0C there).
 
 Does **not** provide: confidentiality (payloads are not encrypted), forward
 secrecy, or protection against a malicious room member or a compromised
@@ -58,16 +59,15 @@ The tag covers the header too.
 | `0x0B` SDISC_DATA | client → relay (from UDP 21032) | `counter u64 ‖ room_len u8 ‖ room_id ‖ ipv4 ‖ tag[16]` | src = own ID, dst = 0, flags = 0 |
 | `0x0C` SDISC_DELIVER | relay → client (to UDP 21032) | `counter u64 ‖ ipv4 ‖ tag[16]` | src = original sender, dst = recipient, flags bit 0 = sender verified |
 
-`room_id`: `[A-Za-z0-9_-]{1,64}`. `ipv4`: the bare IPv4 packet, as in 0x09.
+`room_id`: `[A-Za-z0-9_-]{1,64}`. `ipv4`: the captured IPv4 broadcast/multicast packet.
 Send 0x0A only while the device is in a room, because the relay finds the
 device key through that room's peer list. Send it on joining, again about
 1 s later, then every 25 s. When the relay has not yet cached the room's peer
 list, it drops the first packet and fetches the list in the background, so
 without the early retry the device might not be reachable for up to 25 s.
 
-0x0C flag bit 0 is clear when the original sender used legacy 0x09 (relay in
-`optional` mode). Clients should treat such packets as unauthenticated (drop
-them, or accept them only by local policy).
+The relay sets 0x0C flag bit 0 on every packet (the original sender was
+authenticated); 3.1.x clients drop 0x0C without it.
 
 ## Counters and replay
 
@@ -85,7 +85,7 @@ captured packet can be replayed once while it is still within the skew
 window. Clients whose clocks are off by more than the skew cannot use
 secure discovery.
 
-## Relay behaviour (`discovery.auth`)
+## Relay behaviour
 
 Order for 0x0A/0x0B: parse → room peer list (cached; a miss starts an async
 fetch and drops the packet) → sender must be listed with a key → verify the
@@ -93,49 +93,43 @@ tag → counter check → only then (re)bind the discovery address. For 0x0B,
 then global ingress limit → dedup → per-sender limit → fan-out. Forged
 packets change no state.
 
-| Mode | 0x08/0x09 (legacy) | 0x0A/0x0B | Delivery |
-|------|--------------------|-----------|----------|
-| `off` (default) | 3.0.x behaviour | dropped as unknown type | bare IPv4 |
-| `optional` | accepted, except for an ID with a live authenticated binding (no hijack, no impersonation) | accepted | 0x0C to authenticated recipients, bare IPv4 to legacy ones |
-| `required` | dropped | accepted | 0x0C |
+The relay always runs in `required` mode (`discovery.auth` accepts only
+`required`). Retired 0x08/0x09 are dropped and counted as `drop{retired}`;
+they create no binding. A recipient whose key is missing from the current
+peer list receives nothing. Earlier drafts of this document described `off`
+and `optional` modes; they were removed for 3.1.x.
 
-An authenticated recipient whose key is missing from the current peer list
-receives nothing; it is never downgraded to bare IPv4.
+## Coordinator (implemented in Coordinator 3.1.x, commit 66eb3f8)
 
-## Coordinator requirements (not implemented)
+1. `GET /room/{id}/discovery-peers` returns `pub_key` per item, lists only
+   current room members, and requires `X-Relay-Secret` (the relay sends
+   `control.relay_secret`; serve it over HTTPS).
+2. `POST /relay/register` accepts the relay `pub_key`; `GET /relays` returns
+   it. Clients get no discovery through a relay without one.
+3. `discovery_join` requires room membership.
+4. Device keys: the device ID must be derived from the key, and the first key
+   seen for an ID is pinned. Proof of possession (`device_key_proof`,
+   DEVICE_KEY_PROOF.md) defaults to `off`. Until it is `required`, whoever
+   registers a device ID first decides its key. Because the ID is only 32 bits
+   of SHA-256, a matching key for a not-yet-registered ID can be found in
+   about 2^32 tries. Enable `device_key_proof: required` once clients send
+   proofs.
 
-1. `GET /room/{id}/discovery-peers`: add `"pub_key"` (base64 X25519, as
-   stored at device registration) to each item. Without it, every
-   authenticated packet fails with `drop{auth}`.
-2. `POST /relay/register`: store the relay's `pub_key` and return it in
-   `GET /relays` so that clients can pin it per relay.
-3. **Bind keys to device IDs**: `ReRegisterIdentity`/`RegisterAll`
-   currently overwrite `PubKey` on every registration, without any proof that
-   the device holds the private key. Require proof of possession, and do not
-   let an unauthenticated re-registration change an existing device's key.
-   The device ID (32 bits of SHA-256 of the key) is too short to act as this
-   binding: a key that maps to a given ID can be found in about 2^32 tries.
-4. `discovery_join` (hub.go): check that the device is a member of the room.
-5. Require `X-Relay-Secret` on `discovery-peers` (it lists room members and
-   now keys), and serve it over HTTPS.
+## Client (msst-net-core-31x)
 
-## Client requirements (not implemented)
-
-- Derive `k_c2r`/`k_r2c` per relay from the relay `pub_key` in `/relays`.
-  Use 0x0A/0x0B only when the relay advertises a key; otherwise fall back to
-  0x08/0x09.
-- On UDP 21032, accept only 0x0C that passes tag, `dst_id` and counter checks
-  from the relay it uses. Drop bare IPv4 packets once secure mode is in use.
-  (Today `rx_loop` accepts bare IPv4 from any source.)
-- Keep the counter monotonic as specified, and never log keys.
+- Derives `k_c2r`/`k_r2c` per relay from the relay `pub_key` in `/relays`;
+  no discovery through relays without one.
+- On UDP 21032 accepts only 0x0C that passes tag, `dst_id`, counter and
+  sender-verified checks; never bare IPv4.
+- Keeps the counter monotonic as specified and never logs keys.
 
 ## Deployment order
 
-1. Relay with `auth: optional` (needs the key file; reports `pub_key`).
-2. Coordinator: items 1–5 above.
-3. Clients.
-4. Switch relays to `auth: required` once no legacy clients remain.
-   Until then, legacy clients remain spoofable as before.
+1. Relay (sends `X-Relay-Secret` on `discovery-peers` and `pub_key` on
+   register). Deploy before the Coordinator if it has `relay_secret` set,
+   because otherwise discovery-peers returns 401.
+2. Coordinator 3.1.x.
+3. 3.1.x clients. 3.0.x clients lose relay data (0x04) and discovery.
 
 ## Test vectors
 

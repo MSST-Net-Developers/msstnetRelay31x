@@ -51,15 +51,15 @@ func TestUDPEndToEnd(t *testing.T) {
 		t.Fatalf("ping echo = %x", got)
 	}
 
-	// Ordered delivery of several data packets, including the largest one
+	// Ordered, byte-for-byte delivery of several WireGuard frames, including the largest one
 	// IPv4 UDP can carry (65507 bytes).
-	payloads := [][]byte{fakeIPv4(100, 1), fakeIPv4(1400, 2), fakeIPv4(65507-headerLen, 3)}
-	for _, p := range payloads {
-		if _, err := a.Write(encodePacket(typData, idA, idB, p)); err != nil {
+	frames := [][]byte{wgFrame(idA, idB, 148, 1), wgFrame(idA, idB, 1500+32, 2), wgFrame(idA, idB, 65507-headerLen, 3)}
+	for _, f := range frames {
+		if _, err := a.Write(f); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for i, want := range payloads {
+	for i, want := range frames {
 		if got := recv(b); !bytes.Equal(got, want) {
 			t.Fatalf("packet %d: got %d bytes, want %d", i, len(got), len(want))
 		}
@@ -87,7 +87,7 @@ func TestUDPSecureDiscoveryEndToEnd(t *testing.T) {
 	auth := newSdiscAuth(testKey(t, 0x77))
 	a, b := newTestDevice(t, idA, 0x0a, auth), newTestDevice(t, idB, 0x0b, auth)
 	rooms := fakeSecureRooms{room: {a.peer(t, auth), b.peer(t, auth)}}
-	r := newRelay(conn, authLimits(authRequired), rooms, &stats{})
+	r := newRelay(conn, authLimits(), rooms, &stats{})
 	done := make(chan struct{})
 	go func() { serve(conn, r); close(done) }()
 	defer func() { _ = conn.Close(); <-done }()

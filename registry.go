@@ -16,9 +16,8 @@ import (
 // protocol has no sender authentication, so this cannot distinguish a roaming
 // client from a spoofed registration.
 //
-// Exception (secure discovery): a binding made by an authenticated packet is
-// marked secure, and while it is live, unauthenticated registrations for the
-// same ID are refused (regDenied). Authenticated packets may still rebind it.
+// The discovery registry is only written after sdisc authentication, so the
+// caveat above applies to the data-session registry.
 type registry struct {
 	entries map[uint64]binding
 	max     int
@@ -28,7 +27,6 @@ type registry struct {
 type binding struct {
 	addr     netip.AddrPort
 	lastSeen time.Time
-	secure   bool
 }
 
 type registerResult uint8
@@ -39,7 +37,6 @@ const (
 	regRebound
 	regFull
 	regInvalidAddr
-	regDenied // unauthenticated registration for a live secure binding
 )
 
 func newRegistry(max int, ttl time.Duration) *registry {
@@ -56,9 +53,7 @@ func validClientAddr(a netip.AddrPort) bool {
 	return !ip.IsUnspecified() && !ip.IsMulticast() && ip != netip.AddrFrom4([4]byte{255, 255, 255, 255})
 }
 
-// register binds id to addr. secure reports that the caller authenticated
-// the packet.
-func (r *registry) register(id uint64, addr netip.AddrPort, now time.Time, secure bool) registerResult {
+func (r *registry) register(id uint64, addr netip.AddrPort, now time.Time) registerResult {
 	if !validClientAddr(addr) {
 		return regInvalidAddr
 	}
@@ -66,15 +61,12 @@ func (r *registry) register(id uint64, addr netip.AddrPort, now time.Time, secur
 	if exists && now.Sub(old.lastSeen) >= r.ttl {
 		exists = false // expired: treat as a fresh registration
 	}
-	if exists && old.secure && !secure {
-		return regDenied
-	}
 	if !exists && len(r.entries) >= r.max {
 		if _, present := r.entries[id]; !present {
 			return regFull
 		}
 	}
-	r.entries[id] = binding{addr: addr, lastSeen: now, secure: secure}
+	r.entries[id] = binding{addr: addr, lastSeen: now}
 	switch {
 	case !exists:
 		return regNew
@@ -87,22 +79,11 @@ func (r *registry) register(id uint64, addr netip.AddrPort, now time.Time, secur
 
 // lookup returns the live binding for id.
 func (r *registry) lookup(id uint64, now time.Time) (netip.AddrPort, bool) {
-	b, ok := r.get(id, now)
-	return b.addr, ok
-}
-
-func (r *registry) get(id uint64, now time.Time) (binding, bool) {
 	b, ok := r.entries[id]
 	if !ok || now.Sub(b.lastSeen) >= r.ttl {
-		return binding{}, false
+		return netip.AddrPort{}, false
 	}
-	return b, true
-}
-
-// secureBound reports whether id has a live authenticated binding.
-func (r *registry) secureBound(id uint64, now time.Time) bool {
-	b, ok := r.get(id, now)
-	return ok && b.secure
+	return b.addr, true
 }
 
 // boundTo reports whether id is currently registered at exactly addr.

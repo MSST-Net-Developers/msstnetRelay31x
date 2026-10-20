@@ -5,8 +5,9 @@ import (
 	"errors"
 )
 
-// MSST wire format, shared with msst-net-client-core (src/net/packet.rs) and
-// unchanged from relay 3.0.x:
+// MSST wire format, shared with msst-net-core-31x
+// (crates/msst-core-state/src/net/msst_packet.rs; contract in its
+// docs/RELAY_REQUIREMENTS_3.1.md). Framing is unchanged from 3.0.x:
 //
 //	[magic:   4] "MSST"
 //	[version: 1] 1
@@ -16,21 +17,30 @@ import (
 //	[dst_id:  8] destination device ID (zero for register/keepalive/ping)
 //	[payload: N]
 //
-// The protocol carries no authentication: src_id is a claim, not proof of
-// identity. See README.md "Trust model".
+// Only secure discovery (0x0A–0x0C) is authenticated; elsewhere src_id is a
+// claim, not proof of identity. See README.md "Trust model".
 const (
 	headerLen       = 4 + 1 + 1 + 1 + 8 + 8 // 23
 	protocolVersion = 1
 
-	typRegister          = 0x01
-	typKeepalive         = 0x02
-	typPunch             = 0x03 // legacy; treated as register (3.0.x behaviour)
-	typData              = 0x04
-	typPing              = 0x05
-	typP2PPing           = 0x06
-	typP2PPong           = 0x07
-	typDiscoveryRegister = 0x08
-	typDiscoveryData     = 0x09
+	typRegister  = 0x01
+	typKeepalive = 0x02
+	typPunch     = 0x03 // legacy; treated as register (3.0.x behaviour)
+	typPing      = 0x05
+	typP2PPing   = 0x06
+	typP2PPong   = 0x07
+	typWireGuard = 0x0D // one WireGuard message; all peer data in 3.1.x
+	// 0x0A–0x0C: secure discovery, see sdisc.go.
+
+	// Retired 3.0.x types, dropped and counted: plaintext data (0x04) and
+	// unauthenticated discovery (0x08/0x09). 3.1.x clients never send them.
+	typRetiredData              = 0x04
+	typRetiredDiscoveryRegister = 0x08
+	typRetiredDiscoveryData     = 0x09
+
+	// minWireGuardLen is the smallest WireGuard message (a transport
+	// keepalive: 16-byte header + 16-byte tag).
+	minWireGuardLen = 32
 
 	// pingPayloadLen is the P2P ping/pong payload: seq(4) + timestamp_ms(8).
 	pingPayloadLen = 12
@@ -103,7 +113,8 @@ func validDeviceID(id uint64) bool {
 	return id != 0 && id <= maxDeviceID
 }
 
-// parseDiscoveryPayload splits a TYPE_DISCOVERY_DATA payload:
+// parseDiscoveryPayload splits the room/IP part of a secure discovery data
+// payload:
 //
 //	[room_id_len: 1][room_id: N][ipv4_packet: M]
 //

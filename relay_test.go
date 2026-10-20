@@ -65,34 +65,41 @@ var (
 	addrC = ap("192.0.2.3:21031")
 )
 
-func TestDataForwardStripsHeader(t *testing.T) {
+// wgFrame is a 0x0D frame carrying an n-byte WireGuard-sized payload.
+func wgFrame(src, dst uint64, n int, fill byte) []byte {
+	return encodePacket(typWireGuard, src, dst, bytes.Repeat([]byte{fill}, n))
+}
+
+func TestWireGuardForwardedVerbatim(t *testing.T) {
 	r, w := newTestRelay(t, testLimits(), nil)
 	r.handle(encodePacket(typRegister, idB, 0, nil), addrB, t0)
 
-	ip := fakeIPv4(60, 7)
-	r.handle(encodePacket(typData, idA, idB, ip), addrA, t0)
-
-	out := w.take()
-	if len(out) != 1 || out[0].dst != addrB || !bytes.Equal(out[0].b, ip) {
-		t.Fatalf("want raw payload to B, got %+v", out)
+	// Handshake initiation size and a full 1500-MTU transport message.
+	for _, n := range []int{148, 1500 + 32} {
+		f := wgFrame(idA, idB, n, 7)
+		r.handle(f, addrA, t0)
+		out := w.take()
+		if len(out) != 1 || out[0].dst != addrB || !bytes.Equal(out[0].b, f) {
+			t.Fatalf("%d-byte payload: want whole frame to B, got %d datagrams", n, len(out))
+		}
 	}
-	if r.stats.dataForwarded.Load() != 1 {
+	if r.stats.dataForwarded.Load() != 2 {
 		t.Fatal("counter not incremented")
 	}
 }
 
-func TestDataSenderNeedNotBeRegistered(t *testing.T) {
+func TestWireGuardSenderNeedNotBeRegistered(t *testing.T) {
 	// Clients send through the destination's relay, so an unregistered
 	// sender is legitimate.
 	r, w := newTestRelay(t, testLimits(), nil)
 	r.handle(encodePacket(typKeepalive, idB, 0, nil), addrB, t0)
-	r.handle(encodePacket(typData, idA, idB, fakeIPv4(20, 0)), addrC, t0)
+	r.handle(wgFrame(idA, idB, 32, 0), addrC, t0)
 	if len(w.take()) != 1 {
-		t.Fatal("data from unregistered sender dropped")
+		t.Fatal("frame from unregistered sender dropped")
 	}
 }
 
-func TestDataDrops(t *testing.T) {
+func TestWireGuardDrops(t *testing.T) {
 	r, w := newTestRelay(t, testLimits(), nil)
 	r.handle(encodePacket(typRegister, idB, 0, nil), addrB, t0)
 
@@ -101,13 +108,12 @@ func TestDataDrops(t *testing.T) {
 		pkt  []byte
 		src  netip.AddrPort
 	}{
-		{"unknown dst", encodePacket(typData, idA, idC, fakeIPv4(20, 0)), addrA},
-		{"empty payload", encodePacket(typData, idA, idB, nil), addrA},
-		{"nested MSST header", encodePacket(typData, idA, idB, encodePacket(typData, idA, idC, fakeIPv4(20, 0))), addrA},
-		{"loop to self", encodePacket(typData, idB, idB, fakeIPv4(20, 0)), addrB},
-		{"bad version", append([]byte("MSST\x02"), make([]byte, 30)...), addrA},
-		{"bad magic", append([]byte("XSST\x01\x04"), make([]byte, 30)...), addrA},
-		{"truncated", encodePacket(typData, idA, idB, nil)[:10], addrA},
+		{"unknown dst", wgFrame(idA, idC, 32, 0), addrA},
+		{"shorter than any WireGuard message", wgFrame(idA, idB, minWireGuardLen-1, 0), addrA},
+		{"loop to self", wgFrame(idB, idB, 32, 0), addrB},
+		{"bad version", append([]byte("MSST\x02"), make([]byte, 60)...), addrA},
+		{"bad magic", append([]byte("XSST\x01\x0d"), make([]byte, 60)...), addrA},
+		{"truncated", wgFrame(idA, idB, 32, 0)[:10], addrA},
 		{"unknown type", encodePacket(0x7f, idA, idB, fakeIPv4(20, 0)), addrA},
 	}
 	for _, c := range cases {
@@ -118,9 +124,24 @@ func TestDataDrops(t *testing.T) {
 	}
 	s := r.stats
 	if s.dropUnknownDst.Load() != 1 || s.dropLoop.Load() != 1 || s.dropVersion.Load() != 1 ||
-		s.dropUnknownType.Load() != 1 || s.dropMalformed.Load() != 4 {
+		s.dropUnknownType.Load() != 1 || s.dropMalformed.Load() != 3 {
 		t.Fatalf("unexpected drop counters: unknown_dst=%d loop=%d version=%d type=%d malformed=%d",
 			s.dropUnknownDst.Load(), s.dropLoop.Load(), s.dropVersion.Load(), s.dropUnknownType.Load(), s.dropMalformed.Load())
+	}
+}
+
+func TestRetiredTypesDropped(t *testing.T) {
+	r, w := newTestRelay(t, testLimits(), fakeRooms{room: {idA, idB}})
+	r.handle(encodePacket(typRegister, idB, 0, nil), addrB, t0)
+
+	// Plaintext data (0x04) is no longer forwarded in any form.
+	r.handle(encodePacket(typRetiredData, idA, idB, fakeIPv4(20, 0)), addrA, t0)
+	// Unauthenticated discovery (0x08/0x09) creates no binding and is not
+	// fanned out, so it can neither hijack nor inject.
+	r.handle(encodePacket(typRetiredDiscoveryRegister, idB, 0, nil), addrC, t0)
+	r.handle(encodePacket(typRetiredDiscoveryData, idA, 0, discoveryPayload(room, fakeIPv4(20, 0))), addrA, t0)
+	if len(w.take()) != 0 || r.discSessions.len() != 0 || r.stats.dropRetired.Load() != 3 {
+		t.Fatalf("retired types handled: disc_sessions=%d retired=%d", r.discSessions.len(), r.stats.dropRetired.Load())
 	}
 }
 
@@ -130,7 +151,7 @@ func TestExpiredSessionNotUsed(t *testing.T) {
 	r.handle(encodePacket(typRegister, idB, 0, nil), addrB, t0)
 
 	late := t0.Add(lim.sessionTTL)
-	r.handle(encodePacket(typData, idA, idB, fakeIPv4(20, 0)), addrA, late)
+	r.handle(wgFrame(idA, idB, 32, 0), addrA, late)
 	if len(w.take()) != 0 {
 		t.Fatal("forwarded through expired binding")
 	}
@@ -146,7 +167,7 @@ func TestRebindDeliversOnlyToNewAddress(t *testing.T) {
 	r.handle(encodePacket(typRegister, idB, 0, nil), addrB, t0)
 	moved := ap("203.0.113.2:40001") // NAT rebinding
 	r.handle(encodePacket(typKeepalive, idB, 0, nil), moved, t0.Add(time.Second))
-	r.handle(encodePacket(typData, idA, idB, fakeIPv4(20, 0)), addrA, t0.Add(time.Second))
+	r.handle(wgFrame(idA, idB, 32, 0), addrA, t0.Add(time.Second))
 	out := w.take()
 	if len(out) != 1 || out[0].dst != moved {
 		t.Fatalf("want delivery to rebound address only, got %+v", out)
@@ -259,7 +280,7 @@ func TestSendErrorKeepsSession(t *testing.T) {
 	r, w := newTestRelay(t, testLimits(), nil)
 	r.handle(encodePacket(typRegister, idB, 0, nil), addrB, t0)
 	w.err = errors.New("network is unreachable")
-	r.handle(encodePacket(typData, idA, idB, fakeIPv4(20, 0)), addrA, t0)
+	r.handle(wgFrame(idA, idB, 32, 0), addrA, t0)
 	if r.stats.sendErrors.Load() != 1 || r.stats.dataForwarded.Load() != 0 {
 		t.Fatal("send error not accounted")
 	}
@@ -268,150 +289,97 @@ func TestSendErrorKeepsSession(t *testing.T) {
 	}
 }
 
-// ── Discovery ────────────────────────────────────────────────────────────
+// ── Discovery (limits and lifecycle; authentication is in sdisc_test.go) ──
 
 const room = "space-0a1b2c3d"
 
-func discRelay(t *testing.T, lim relayLimits, rooms roomPeerLookup) (*relay, *fakeWriter) {
-	r, w := newTestRelay(t, lim, rooms)
-	for id, a := range map[uint64]netip.AddrPort{idA: addrA, idB: addrB, idC: addrC} {
-		r.handle(encodePacket(typDiscoveryRegister, id, 0, nil), a, t0)
-	}
-	return r, w
-}
-
-func TestDiscoveryFanout(t *testing.T) {
-	r, w := discRelay(t, testLimits(), fakeRooms{room: {idA, idB, idC, 0xdddddddd}})
-	ip := fakeIPv4(48, 1)
-	r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload(room, ip)), addrA, t0)
-
-	out := w.take()
-	got := map[netip.AddrPort]bool{}
-	for _, s := range out {
-		if !bytes.Equal(s.b, ip) {
-			t.Fatalf("discovery egress is not the bare IPv4 packet: %x", s.b)
-		}
-		got[s.dst] = true
-	}
-	// Excludes the sender and the unregistered peer.
-	if len(out) != 2 || !got[addrB] || !got[addrC] {
-		t.Fatalf("fan-out = %+v", out)
-	}
-	// Discovery registrations are independent of data sessions.
-	if r.sessions.len() != 0 {
-		t.Fatal("discovery registration created a data session")
-	}
-}
-
-func TestDiscoveryDrops(t *testing.T) {
-	r, w := discRelay(t, testLimits(), fakeRooms{room: {idA, idB}, "space-other": {idB, idC}})
-	ip := fakeIPv4(20, 2)
-
-	// Sender not a discovery participant of the claimed room.
-	r.handle(encodePacket(typDiscoveryData, idC, 0, discoveryPayload(room, ip)), addrC, t0)
-	// Unknown room (no peer list available).
-	r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload("space-unknown", ip)), addrA, t0)
-	// Malformed payload.
-	r.handle(encodePacket(typDiscoveryData, idA, 0, []byte{3, 'a'}), addrA, t0)
-	// Invalid sender ID.
-	r.handle(encodePacket(typDiscoveryData, 0, 0, discoveryPayload(room, ip)), addrA, t0)
-	if out := w.take(); len(out) != 0 {
-		t.Fatalf("forwarded: %+v", out)
-	}
-	if r.stats.dropNotInRoom.Load() != 1 || r.stats.dropRoomUnknown.Load() != 1 || r.stats.dropMalformed.Load() != 2 {
-		t.Fatalf("counters: not_in_room=%d room_unknown=%d malformed=%d",
-			r.stats.dropNotInRoom.Load(), r.stats.dropRoomUnknown.Load(), r.stats.dropMalformed.Load())
+func TestDiscoveryDedupAndRateLimits(t *testing.T) {
+	f := newSecureFixture(t)
+	ip := fakeIPv4(20, 3)
+	// Same IP packet from the same sender within the dedup TTL (each with a
+	// fresh counter, so not a replay).
+	f.r.handle(f.a.packet(room, ip, tNow), addrA, tNow)
+	f.r.handle(f.a.packet(room, ip, tNow), addrA, tNow.Add(time.Second))
+	if n := len(f.w.take()); n != 2 { // one packet × B, C
+		t.Fatalf("dedup: sent %d, want 2", n)
 	}
 
-	// Duplicate suppression (keyed on sender + IP packet, not room).
-	ip2 := fakeIPv4(20, 3)
-	r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload(room, ip2)), addrA, t0)
-	r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload(room, ip2)), addrA, t0.Add(time.Second))
-	if n := len(w.take()); n != 1 {
-		t.Fatalf("dedup: forwarded %d, want 1", n)
-	}
-}
-
-func TestDiscoverySenderInRoomOptional(t *testing.T) {
-	lim := testLimits()
-	lim.discRequireSenderIn = false
-	r, w := discRelay(t, lim, fakeRooms{room: {idB}})
-	r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload(room, fakeIPv4(20, 0))), addrA, t0)
-	if n := len(w.take()); n != 1 {
-		t.Fatalf("forwarded %d, want 1 (3.0.x behaviour)", n)
-	}
-}
-
-func TestDiscoveryRateLimits(t *testing.T) {
-	lim := testLimits()
+	lim := authLimits()
 	lim.discSenderRate, lim.discSenderBurst = 1, 2
-	r, w := discRelay(t, lim, fakeRooms{room: {idA, idB}})
+	f = newSecureFixtureLimits(t, lim)
 	for i := range 5 {
-		r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload(room, fakeIPv4(20, byte(i)))), addrA, t0)
+		f.r.handle(f.a.packet(room, fakeIPv4(20, byte(i)), tNow), addrA, tNow)
 	}
-	if n := len(w.take()); n != 2 {
-		t.Fatalf("per-sender limit: forwarded %d, want 2", n)
+	if n := len(f.w.take()); n != 4 { // 2 packets × B, C
+		t.Fatalf("per-sender limit: sent %d, want 4", n)
 	}
 
 	// Egress budget counts recipients, so a large room cannot amplify past it.
-	lim = testLimits()
+	lim = authLimits()
 	lim.discEgressRate, lim.discEgressBurst = 1, 3
-	r, w = discRelay(t, lim, fakeRooms{room: {idA, idB, idC}})
-	r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload(room, fakeIPv4(20, 1))), addrA, t0)
-	r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload(room, fakeIPv4(20, 2))), addrA, t0)
-	if n := len(w.take()); n != 2 {
+	f = newSecureFixtureLimits(t, lim)
+	f.r.handle(f.a.packet(room, fakeIPv4(20, 1), tNow), addrA, tNow)
+	f.r.handle(f.a.packet(room, fakeIPv4(20, 2), tNow), addrA, tNow)
+	if n := len(f.w.take()); n != 2 {
 		t.Fatalf("egress limit: sent %d, want 2 (first packet only)", n)
 	}
 }
 
 func TestDiscoveryFanoutCap(t *testing.T) {
-	lim := testLimits()
-	lim.discMaxFanout = 2
-	peers := []uint64{idB, idC, 0xdddddddd, idA} // sender listed last
-	r, w := discRelay(t, lim, fakeRooms{room: peers})
-	r.handle(encodePacket(typDiscoveryRegister, 0xdddddddd, 0, nil), ap("192.0.2.4:21032"), t0)
-	r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload(room, fakeIPv4(20, 0))), addrA, t0)
-	if n := len(w.take()); n != 2 {
-		t.Fatalf("fan-out cap: sent %d, want 2", n)
+	lim := authLimits()
+	lim.discMaxFanout = 1
+	f := newSecureFixtureLimits(t, lim)
+	f.r.handle(f.a.packet(room, fakeIPv4(20, 0), tNow), addrA, tNow)
+	if n := len(f.w.take()); n != 1 {
+		t.Fatalf("fan-out cap: sent %d, want 1", n)
 	}
 }
 
 func TestDiscoveryDisabled(t *testing.T) {
-	lim := testLimits()
+	lim := authLimits()
 	lim.discoveryEnabled = false
-	r, w := newTestRelay(t, lim, fakeRooms{room: {idA, idB}})
-	r.handle(encodePacket(typDiscoveryRegister, idB, 0, nil), addrB, t0)
-	r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload(room, fakeIPv4(20, 0))), addrA, t0)
+	f := newSecureFixture(t) // keys and rooms only
+	r, w := newTestRelay(t, lim, f.rooms)
+	r.handle(f.a.packet(room, nil, tNow), addrA, tNow)
+	r.handle(f.a.packet(room, fakeIPv4(20, 0), tNow), addrA, tNow)
 	if len(w.take()) != 0 || r.stats.dropUnknownType.Load() != 2 {
 		t.Fatal("discovery handled while disabled")
 	}
 }
 
 func TestDiscoveryWithoutCoordinator(t *testing.T) {
-	r, w := discRelay(t, testLimits(), nil)
-	r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload(room, fakeIPv4(20, 0))), addrA, t0)
+	f := newSecureFixture(t)
+	r, w := newTestRelay(t, authLimits(), nil)
+	r.handle(f.a.packet(room, fakeIPv4(20, 0), tNow), addrA, tNow)
 	if len(w.take()) != 0 || r.stats.dropRoomUnknown.Load() != 1 {
 		t.Fatal("expected room-unknown drop without a Coordinator")
 	}
 }
 
 func TestMaintenanceBoundsState(t *testing.T) {
-	lim := testLimits()
-	r, _ := newTestRelay(t, lim, fakeRooms{})
-	for i := range 1000 {
-		id := uint64(i + 1)
-		src := netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, 100, byte(i)}), uint16(1000+i))
-		r.handle(encodePacket(typRegister, id, 0, nil), src, t0)
-		r.handle(encodePacket(typDiscoveryData, id, 0, discoveryPayload(room, fakeIPv4(20, byte(i)))), src, t0)
+	lim := authLimits()
+	auth := newSdiscAuth(testKey(t, 0x77))
+	devs := make([]*testDevice, 0, 300)
+	peers := make([]discPeer, 0, 300)
+	for i := range 300 {
+		d := newTestDevice(t, uint64(i+1), byte(i), auth)
+		devs = append(devs, d)
+		peers = append(peers, d.peer(t, auth))
 	}
-	if r.sessions.len() != 1000 || r.discSessions.len() != 1000 {
-		t.Fatalf("setup: %d %d", r.sessions.len(), r.discSessions.len())
+	r, _ := newTestRelay(t, lim, fakeSecureRooms{room: peers})
+	for i, d := range devs {
+		src := netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, 100, byte(i)}), uint16(1000+i))
+		r.handle(encodePacket(typRegister, d.id, 0, nil), src, tNow)
+		r.handle(d.packet(room, fakeIPv4(20, byte(i)), tNow), src, tNow)
+	}
+	if r.sessions.len() != 300 || r.discSessions.len() != 300 || r.discReplay.len() != 300 {
+		t.Fatalf("setup: %d %d %d", r.sessions.len(), r.discSessions.len(), r.discReplay.len())
 	}
 	// Maintenance runs inline from handle once the interval has passed.
-	r.handle([]byte("junk"), addrA, t0.Add(lim.sessionTTL+lim.discSessionTTL))
-	if r.sessions.len() != 0 || r.discSessions.len() != 0 || r.discSender.len() != 0 || r.discDedup.len() != 0 {
-		t.Fatalf("state not reclaimed: sessions=%d disc=%d senders=%d dedup=%d",
-			r.sessions.len(), r.discSessions.len(), r.discSender.len(), r.discDedup.len())
+	r.handle([]byte("junk"), addrA, tNow.Add(lim.sessionTTL+lim.discSessionTTL))
+	if r.sessions.len() != 0 || r.discSessions.len() != 0 || r.discSender.len() != 0 || r.discDedup.len() != 0 || r.discReplay.len() != 0 {
+		t.Fatalf("state not reclaimed: sessions=%d disc=%d senders=%d dedup=%d replay=%d",
+			r.sessions.len(), r.discSessions.len(), r.discSender.len(), r.discDedup.len(), r.discReplay.len())
 	}
 }
 
@@ -419,7 +387,7 @@ func BenchmarkForwardData(b *testing.B) {
 	w := &discardWriter{}
 	r := newRelay(w, testLimits(), nil, &stats{})
 	r.handle(encodePacket(typRegister, idB, 0, nil), addrB, t0)
-	pkt := encodePacket(typData, idA, idB, fakeIPv4(1400, 0))
+	pkt := wgFrame(idA, idB, 1312, 0) // 1280-MTU transport message
 	b.ReportAllocs()
 	for b.Loop() {
 		r.handle(pkt, addrA, t0)

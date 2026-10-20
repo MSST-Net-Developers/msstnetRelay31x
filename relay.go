@@ -35,8 +35,6 @@ type relayLimits struct {
 	discDedupTTL        time.Duration
 	discDedupMax        int
 	discMaxFanout       int
-	discRequireSenderIn bool
-	discAuth            authMode
 	discAuthSkew        time.Duration // accepted |client clock - relay clock|
 	maintenanceInterval time.Duration
 }
@@ -58,18 +56,16 @@ type relay struct {
 	pingLimit  *tokenBucket // relay ping echoes (reflection bound)
 	probeLimit *tokenBucket // P2P ping/pong forwarding (loop bound)
 
-	discSessions *registry // device ID → discovery socket address
+	discSessions *registry // device ID → discovery socket address (sdisc-authenticated)
 	discSender   *keyedLimiter
 	discIngress  *tokenBucket
 	discEgress   *tokenBucket
 	discDedup    *dedupCache
 	rooms        roomPeerLookup // nil: discovery peers unavailable (no Coordinator)
 	fanout       []fanoutTarget
-
-	// Secure discovery; nil/zero unless lim.discAuth != authOff.
-	discReplay *replayGuard
-	txCounter  uint64 // last counter used on a 0x0C packet
-	deliverBuf []byte // 0x0C egress scratch
+	discReplay   *replayGuard
+	txCounter    uint64 // last counter used on a 0x0C packet
+	deliverBuf   []byte // 0x0C egress scratch
 
 	nextMaintenance time.Time
 }
@@ -92,17 +88,13 @@ func newRelay(out datagramWriter, lim relayLimits, rooms roomPeerLookup, st *sta
 		r.discEgress = newTokenBucket(lim.discEgressRate, lim.discEgressBurst)
 		r.discDedup = newDedupCache(lim.discDedupMax, lim.discDedupTTL)
 		r.fanout = make([]fanoutTarget, 0, lim.discMaxFanout)
-		if lim.discAuth != authOff {
-			r.discReplay = newReplayGuard(lim.discMaxSessions, lim.discSessionTTL, lim.discAuthSkew)
-			r.deliverBuf = make([]byte, 0, headerLen+sdiscCounterLen+maxDatagram+sdiscTagLen)
-		}
+		r.discReplay = newReplayGuard(lim.discMaxSessions, lim.discSessionTTL, lim.discAuthSkew)
+		r.deliverBuf = make([]byte, 0, headerLen+sdiscCounterLen+maxDatagram+sdiscTagLen)
 	}
 	return r
 }
 
-// fanoutTarget is one discovery recipient. keys != nil means the recipient
-// registered with authentication and receives 0x0C; otherwise it receives the
-// bare IPv4 packet (3.0.x).
+// fanoutTarget is one discovery recipient.
 type fanoutTarget struct {
 	id   uint64
 	addr netip.AddrPort
@@ -129,10 +121,10 @@ func (r *relay) handle(buf []byte, src netip.AddrPort, now time.Time) {
 
 	switch p.typ {
 	case typRegister, typKeepalive, typPunch:
-		r.register(r.sessions, p.srcID, src, now, "session", false)
+		r.register(r.sessions, p.srcID, src, now, "session")
 
-	case typData:
-		r.forwardData(p, src, now)
+	case typWireGuard:
+		r.forwardWireGuard(p, src, now)
 
 	case typPing:
 		r.echoPing(p, src, now)
@@ -153,46 +145,27 @@ func (r *relay) handle(buf []byte, src netip.AddrPort, now time.Time) {
 		// destination.
 		r.forwardProbe(p, src, now)
 
-	case typDiscoveryRegister:
-		if r.discSessions == nil {
-			r.stats.dropUnknownType.Add(1)
-			return
-		}
-		if r.lim.discAuth == authRequired {
-			r.stats.dropUnauthenticated.Add(1)
-			return
-		}
-		r.register(r.discSessions, p.srcID, src, now, "discovery", false)
-
-	case typDiscoveryData:
-		if r.discSessions == nil {
-			r.stats.dropUnknownType.Add(1)
-			return
-		}
-		if r.lim.discAuth == authRequired {
-			r.stats.dropUnauthenticated.Add(1)
-			return
-		}
-		r.forwardDiscovery(p, src, now)
-
 	case typSecureDiscoveryRegister, typSecureDiscoveryData:
-		if r.discReplay == nil {
+		if r.discSessions == nil {
 			r.stats.dropUnknownType.Add(1)
 			return
 		}
 		r.secureDiscovery(p, src, now)
+
+	case typRetiredData, typRetiredDiscoveryRegister, typRetiredDiscoveryData:
+		r.stats.dropRetired.Add(1)
 
 	default:
 		r.stats.dropUnknownType.Add(1)
 	}
 }
 
-func (r *relay) register(reg *registry, id uint64, src netip.AddrPort, now time.Time, kind string, secure bool) {
+func (r *relay) register(reg *registry, id uint64, src netip.AddrPort, now time.Time, kind string) {
 	if !validDeviceID(id) {
 		r.stats.invalidRegistrant.Add(1)
 		return
 	}
-	switch reg.register(id, src, now, secure) {
+	switch reg.register(id, src, now) {
 	case regNew:
 		r.stats.registrations.Add(1)
 		r.logs.printf(now, "%s registered: id=%08x addr=%s", kind, id, src)
@@ -204,28 +177,24 @@ func (r *relay) register(reg *registry, id uint64, src netip.AddrPort, now time.
 		r.logs.printf(now, "%s table full (%d): rejecting id=%08x", kind, reg.max, id)
 	case regInvalidAddr:
 		r.stats.invalidRegistrant.Add(1)
-	case regDenied:
-		r.stats.dropUnauthenticated.Add(1)
 	case regRefreshed:
 	}
 }
 
-// forwardData strips the MSST header and sends the bare payload to the
-// destination's registered address (3.0.x wire behaviour; the receiving client
-// treats a raw IP datagram from the relay as inbound traffic).
+// forwardWireGuard sends the whole datagram, header included and byte for
+// byte, to dst_id's registered address. The payload is one WireGuard message,
+// opaque to the relay (RELAY_REQUIREMENTS_3.1.md).
 //
-// The sender is not required to be registered here: clients send data via the
-// destination peer's relay, which may differ from their own.
-func (r *relay) forwardData(p packet, src netip.AddrPort, now time.Time) {
-	if len(p.payload) == 0 {
-		r.stats.dropMalformed.Add(1)
-		return
-	}
-	// A payload that is itself an MSST packet would be re-interpreted as a
-	// control/data packet by the receiver (or by another relay), letting a
-	// sender smuggle headers through the relay. The client never delivers
-	// such payloads as IP traffic, so dropping them loses nothing.
-	if hasMagic(p.payload) {
+// The sender is not required to be registered here: clients send via the
+// destination's relay, which may differ from their own.
+//
+// Because the frame is forwarded unchanged, a frame that reaches another
+// relay is processed there again. A two-relay loop (spoofed registrations
+// pointing R1 and R2 at each other) is cut by the dst == src check; longer
+// cycles need spoofed registrations at three or more relays and are not
+// detected (see README.md "Trust model").
+func (r *relay) forwardWireGuard(p packet, src netip.AddrPort, now time.Time) {
+	if len(p.payload) < minWireGuardLen {
 		r.stats.dropMalformed.Add(1)
 		return
 	}
@@ -238,7 +207,7 @@ func (r *relay) forwardData(p packet, src netip.AddrPort, now time.Time) {
 		r.stats.dropLoop.Add(1)
 		return
 	}
-	if r.send(p.payload, dst, now) {
+	if r.send(p.raw, dst, now) {
 		r.stats.dataForwarded.Add(1)
 	}
 }
@@ -283,55 +252,6 @@ func (r *relay) forwardProbe(p packet, src netip.AddrPort, now time.Time) {
 	if r.send(p.raw, dst, now) {
 		r.stats.probesForwarded.Add(1)
 	}
-}
-
-// forwardDiscovery fans a legacy (unauthenticated) discovery IPv4 packet out
-// to the other discovery participants of the claimed room that are registered
-// at this relay.
-func (r *relay) forwardDiscovery(p packet, src netip.AddrPort, now time.Time) {
-	roomID, ipPkt, ok := parseDiscoveryPayload(p.payload)
-	if !ok || !validDeviceID(p.srcID) {
-		r.stats.dropMalformed.Add(1)
-		return
-	}
-	// An ID that authenticated recently cannot be impersonated by
-	// unauthenticated packets (optional mode).
-	if r.discReplay != nil && r.discSessions.secureBound(p.srcID, now) {
-		r.stats.dropUnauthenticated.Add(1)
-		return
-	}
-	// Data packets refresh the discovery binding, as in 3.0.x (this grants
-	// nothing beyond what a register packet already does).
-	r.register(r.discSessions, p.srcID, src, now, "discovery", false)
-
-	if !r.discIngress.allow(now) {
-		r.stats.dropRateLimited.Add(1)
-		return
-	}
-	if !r.discDedup.firstSeen(p.srcID, ipPkt, now) {
-		r.stats.dropDuplicate.Add(1)
-		return
-	}
-	if !r.discSender.allow(p.srcID, now) {
-		r.stats.dropRateLimited.Add(1)
-		return
-	}
-	// Only forward from a sender actually bound at this address, so stale or
-	// table-full registrations cannot be used to inject into a room.
-	if !r.discSessions.boundTo(p.srcID, src, now) {
-		r.stats.dropUnverifiedSrc.Add(1)
-		return
-	}
-	if r.rooms == nil {
-		r.stats.dropRoomUnknown.Add(1)
-		return
-	}
-	peers, ok := r.rooms.peers(roomID, now)
-	if !ok {
-		r.stats.dropRoomUnknown.Add(1)
-		return
-	}
-	r.fanOutDiscovery(p.srcID, src, peers, ipPkt, false, r.lim.discRequireSenderIn, now)
 }
 
 // secureDiscovery handles authenticated discovery register (0x0A) and data
@@ -387,7 +307,7 @@ func (r *relay) secureDiscovery(p packet, src netip.AddrPort, now time.Time) {
 	}
 	// Authenticated: the sender may (re)bind its discovery address, which
 	// also covers NAT rebinding and roaming.
-	r.register(r.discSessions, p.srcID, src, now, "discovery", true)
+	r.register(r.discSessions, p.srcID, src, now, "discovery")
 	if !isData {
 		return
 	}
@@ -408,40 +328,25 @@ func (r *relay) secureDiscovery(p packet, src netip.AddrPort, now time.Time) {
 		r.stats.dropUnverifiedSrc.Add(1)
 		return
 	}
-	r.fanOutDiscovery(p.srcID, src, peers, ipPkt, true, true, now)
+	r.fanOutDiscovery(p.srcID, src, peers, ipPkt, now)
 }
 
-// fanOutDiscovery sends ipPkt to the room's other participants registered
-// here. verified reports whether senderID was authenticated.
-func (r *relay) fanOutDiscovery(senderID uint64, src netip.AddrPort, peers []discPeer, ipPkt []byte, verified, requireSender bool, now time.Time) {
+// fanOutDiscovery sends ipPkt as 0x0C to the room's other participants
+// registered here. The sender has been authenticated and found in peers.
+func (r *relay) fanOutDiscovery(senderID uint64, src netip.AddrPort, peers []discPeer, ipPkt []byte, now time.Time) {
 	r.fanout = r.fanout[:0]
-	senderInRoom := false
 	for _, peer := range peers {
-		if peer.id == senderID {
-			senderInRoom = true
-			continue
-		}
 		if len(r.fanout) >= r.lim.discMaxFanout {
-			continue // keep scanning for the sender
+			break
 		}
-		b, ok := r.discSessions.get(peer.id, now)
-		if !ok || b.addr == src {
+		// A peer without a key cannot have registered here; this also skips
+		// one whose key was removed since.
+		if peer.id == senderID || peer.keys == nil {
 			continue
 		}
-		t := fanoutTarget{id: peer.id, addr: b.addr}
-		if b.secure {
-			// Never downgrade an authenticated recipient to bare IPv4; if
-			// its key is no longer listed it gets nothing.
-			if peer.keys == nil {
-				continue
-			}
-			t.keys = peer.keys
+		if addr, ok := r.discSessions.lookup(peer.id, now); ok && addr != src {
+			r.fanout = append(r.fanout, fanoutTarget{id: peer.id, addr: addr, keys: peer.keys})
 		}
-		r.fanout = append(r.fanout, t)
-	}
-	if requireSender && !senderInRoom {
-		r.stats.dropNotInRoom.Add(1)
-		return
 	}
 	if len(r.fanout) == 0 {
 		return
@@ -450,16 +355,9 @@ func (r *relay) fanOutDiscovery(senderID uint64, src netip.AddrPort, peers []dis
 		r.stats.dropRateLimited.Add(1)
 		return
 	}
-	var deliver []byte // built on first secure recipient
+	msg := r.buildDeliver(senderID, ipPkt, now)
 	for _, t := range r.fanout {
-		out := ipPkt
-		if t.keys != nil {
-			if deliver == nil {
-				deliver = r.buildDeliver(senderID, ipPkt, verified, now)
-			}
-			out = r.sealDeliver(deliver, t.id, t.keys)
-		}
-		if r.send(out, t.addr, now) {
+		if r.send(r.sealDeliver(msg, t.id, t.keys), t.addr, now) {
 			r.stats.discoveryForwarded.Add(1)
 		}
 	}
@@ -467,18 +365,14 @@ func (r *relay) fanOutDiscovery(senderID uint64, src netip.AddrPort, peers []dis
 
 // buildDeliver writes a 0x0C packet without dst_id and tag into deliverBuf:
 //
-//	hdr(type 0x0C, flags, src_id=sender, dst_id=recipient) | counter u64 | ipv4 | tag
+//	hdr(type 0x0C, flags=sender verified, src_id=sender, dst_id=recipient) | counter u64 | ipv4 | tag
 //
 // One counter is used for all recipients of a packet (each has its own key
 // and dst_id); the read loop is sequential, so counters increase per
 // recipient.
-func (r *relay) buildDeliver(senderID uint64, ipPkt []byte, verified bool, now time.Time) []byte {
-	var flags byte
-	if verified {
-		flags = sdiscFlagSenderVerified
-	}
+func (r *relay) buildDeliver(senderID uint64, ipPkt []byte, now time.Time) []byte {
 	r.txCounter = nextCounter(r.txCounter, now)
-	b := append(r.deliverBuf[:0], 'M', 'S', 'S', 'T', protocolVersion, typSecureDiscoveryDeliver, flags)
+	b := append(r.deliverBuf[:0], 'M', 'S', 'S', 'T', protocolVersion, typSecureDiscoveryDeliver, sdiscFlagSenderVerified)
 	b = binary.BigEndian.AppendUint64(b, senderID)
 	b = binary.BigEndian.AppendUint64(b, 0) // dst_id, set per recipient
 	b = binary.BigEndian.AppendUint64(b, r.txCounter)
@@ -518,9 +412,7 @@ func (r *relay) maintain(now time.Time) {
 		r.discSessions.sweep(now)
 		r.discSender.sweep(now)
 		r.discDedup.sweep(now)
-		if r.discReplay != nil {
-			r.discReplay.sweep(now)
-		}
+		r.discReplay.sweep(now)
 		r.stats.discoverySessions.Store(int64(r.discSessions.len()))
 	}
 	if rc, ok := r.rooms.(*roomCache); ok && rc != nil {

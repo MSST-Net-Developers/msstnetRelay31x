@@ -26,7 +26,7 @@ type controlClient struct {
 	region    string
 	addr      string
 	secret    string
-	pubKey    string // secure-discovery public key (base64); empty when off
+	pubKey    string // secure-discovery public key (base64); empty when discovery is disabled
 	interval  time.Duration
 	http      *http.Client
 

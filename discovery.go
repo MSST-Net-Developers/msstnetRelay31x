@@ -18,11 +18,12 @@ import (
 
 // Game-discovery proxy support.
 //
-// Clients register a separate UDP socket (client port 21032) with
-// TYPE_DISCOVERY_REGISTER and send captured IPv4 broadcast/multicast packets as
-// TYPE_DISCOVERY_DATA. The relay forwards the bare IPv4 packet to the
-// discovery address of every other device that has done `discovery_join` for
-// the same room on the Coordinator (GET /room/{id}/discovery-peers).
+// Clients register a separate UDP socket (client port 21032) with sdisc
+// register (0x0A) and send captured IPv4 broadcast/multicast packets as sdisc
+// data (0x0B). The relay authenticates them (sdisc.go) and delivers the IPv4
+// packet as 0x0C to the discovery address of every other device that has
+// done `discovery_join` for the same room on the Coordinator
+// (GET /room/{id}/discovery-peers).
 //
 // In 3.0.x the peer list was fetched synchronously inside the UDP read loop,
 // stalling all forwarding for up to the HTTP timeout on every cache miss. Here
@@ -30,10 +31,9 @@ import (
 // background workers and the triggering packet is dropped. Games re-broadcast
 // discovery packets periodically, so the next one is forwarded.
 //
-// With secure discovery enabled the Coordinator response also carries each
-// peer's X25519 public key; the workers derive the per-device MAC keys (the
-// only asymmetric operation) and store them with the peer list, so the read
-// loop does only HMAC.
+// The Coordinator response also carries each peer's X25519 public key; the
+// workers derive the per-device MAC keys (the only asymmetric operation) and
+// store them with the peer list, so the read loop does only HMAC.
 
 const (
 	maxPeersResponseBytes = 1 << 20
@@ -235,10 +235,11 @@ func (c *roomCache) sweep(now time.Time) {
 // coordinatorPeerFetcher returns a peerFetcher that queries
 // GET {base}/room/{roomID}/discovery-peers. Response shape (Coordinator
 // room.go handleDiscoveryPeers): [{"device_id":"device-xxxxxxxx", ...}, ...].
-// For secure discovery each item also needs "pub_key" (base64 X25519, as in
-// device registration); Coordinator 3.1.x does not send it yet, and peers
-// without a valid key cannot use authenticated discovery.
-func coordinatorPeerFetcher(base string, client *http.Client) peerFetcher {
+// Each item also carries "pub_key" (base64 X25519, as bound at device
+// registration); peers without a valid key cannot use discovery. The
+// endpoint lists room members and their keys, so the Coordinator requires
+// X-Relay-Secret when it has relay_secret set.
+func coordinatorPeerFetcher(base, secret string, client *http.Client) peerFetcher {
 	base = strings.TrimRight(base, "/")
 	return func(ctx context.Context, roomID string) ([]peerRecord, error) {
 		if !validRoomID(roomID) {
@@ -249,6 +250,9 @@ func coordinatorPeerFetcher(base string, client *http.Client) peerFetcher {
 		if err != nil {
 			return nil, err
 		}
+		if secret != "" {
+			req.Header.Set("X-Relay-Secret", secret)
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return nil, err
@@ -256,6 +260,9 @@ func coordinatorPeerFetcher(base string, client *http.Client) peerFetcher {
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			if resp.StatusCode == http.StatusUnauthorized {
+				return nil, fmt.Errorf("coordinator returned %s (check control.relay_secret)", resp.Status)
+			}
 			return nil, fmt.Errorf("coordinator returned %s", resp.Status)
 		}
 		var items []struct {

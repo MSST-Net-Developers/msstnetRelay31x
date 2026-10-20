@@ -127,9 +127,8 @@ func (f fakeSecureRooms) peers(roomID []byte, _ time.Time) ([]discPeer, bool) {
 // tNow is a wall-clock-like time; counters encode unix ms.
 var tNow = time.UnixMilli(1_760_000_000_000)
 
-func authLimits(mode authMode) relayLimits {
+func authLimits() relayLimits {
 	lim := testLimits()
-	lim.discAuth = mode
 	lim.discAuthSkew = 30 * time.Second
 	return lim
 }
@@ -142,19 +141,26 @@ type secureFixture struct {
 	rooms   fakeSecureRooms
 }
 
-// newSecureFixture: A, B, C are in room with keys; B and C are registered
-// with authentication.
-func newSecureFixture(t *testing.T, mode authMode) *secureFixture {
+// newSecureFixture: A, B, C are in room with keys; B and C are registered.
+func newSecureFixture(t *testing.T) *secureFixture {
+	t.Helper()
+	return newSecureFixtureLimits(t, authLimits())
+}
+
+func newSecureFixtureLimits(t *testing.T, lim relayLimits) *secureFixture {
 	t.Helper()
 	f := &secureFixture{auth: newSdiscAuth(testKey(t, 0x77))}
 	f.a = newTestDevice(t, idA, 0x0a, f.auth)
 	f.b = newTestDevice(t, idB, 0x0b, f.auth)
 	f.c = newTestDevice(t, idC, 0x0c, f.auth)
 	f.rooms = fakeSecureRooms{room: {f.a.peer(t, f.auth), f.b.peer(t, f.auth), f.c.peer(t, f.auth)}}
-	f.r, f.w = newTestRelay(t, authLimits(mode), f.rooms)
+	f.r, f.w = newTestRelay(t, lim, f.rooms)
 	f.r.handle(f.b.packet(room, nil, tNow), addrB, tNow)
 	f.r.handle(f.c.packet(room, nil, tNow), addrC, tNow)
-	if !f.r.discSessions.secureBound(idB, tNow) || !f.r.discSessions.secureBound(idC, tNow) {
+	if b, _ := f.r.discSessions.lookup(idB, tNow); b != addrB {
+		t.Fatal("setup: secure registration failed")
+	}
+	if c, _ := f.r.discSessions.lookup(idC, tNow); c != addrC {
 		t.Fatal("setup: secure registration failed")
 	}
 	return f
@@ -300,7 +306,7 @@ func TestNextCounterMonotonic(t *testing.T) {
 // ── Forwarding ───────────────────────────────────────────────────────────
 
 func TestSecureDiscoveryFanout(t *testing.T) {
-	f := newSecureFixture(t, authOptional)
+	f := newSecureFixture(t)
 	ip := fakeIPv4(48, 1)
 	f.r.handle(f.a.packet(room, ip, tNow), addrA, tNow)
 
@@ -318,13 +324,13 @@ func TestSecureDiscoveryFanout(t *testing.T) {
 			t.Fatalf("deliver: flags=%x src=%08x ip=%x", flags, src, got)
 		}
 	}
-	if !f.r.discSessions.secureBound(idA, tNow) {
+	if a, _ := f.r.discSessions.lookup(idA, tNow); a != addrA {
 		t.Fatal("authenticated data did not bind the sender")
 	}
 }
 
 func TestSecureDiscoveryRejectsForgery(t *testing.T) {
-	f := newSecureFixture(t, authOptional)
+	f := newSecureFixture(t)
 	ip := fakeIPv4(20, 1)
 	evil := ap("192.0.2.66:4444")
 
@@ -363,7 +369,7 @@ func TestSecureDiscoveryRejectsForgery(t *testing.T) {
 }
 
 func TestSecureDiscoveryReplay(t *testing.T) {
-	f := newSecureFixture(t, authOptional)
+	f := newSecureFixture(t)
 	p1 := f.a.packet(room, fakeIPv4(20, 1), tNow)
 	p2 := f.a.packet(room, fakeIPv4(20, 2), tNow)
 	f.r.handle(p2, addrA, tNow)
@@ -380,7 +386,7 @@ func TestSecureDiscoveryReplay(t *testing.T) {
 }
 
 func TestSecureDiscoveryRoaming(t *testing.T) {
-	f := newSecureFixture(t, authOptional)
+	f := newSecureFixture(t)
 	moved := ap("203.0.113.99:50000")
 	f.r.handle(f.b.packet(room, nil, tNow.Add(time.Second)), moved, tNow.Add(time.Second))
 	if a, _ := f.r.discSessions.lookup(idB, tNow.Add(time.Second)); a != moved {
@@ -388,100 +394,50 @@ func TestSecureDiscoveryRoaming(t *testing.T) {
 	}
 }
 
-func TestSecureBindingResistsLegacySpoof(t *testing.T) {
-	f := newSecureFixture(t, authOptional)
+func TestSecureBindingResistsRetiredSpoof(t *testing.T) {
+	f := newSecureFixture(t)
 	evil := ap("192.0.2.66:4444")
-	f.r.handle(encodePacket(typDiscoveryRegister, idB, 0, nil), evil, tNow)
-	f.r.handle(encodePacket(typDiscoveryData, idB, 0, discoveryPayload(room, fakeIPv4(20, 0))), evil, tNow)
+	f.r.handle(encodePacket(typRetiredDiscoveryRegister, idB, 0, nil), evil, tNow)
+	f.r.handle(encodePacket(typRetiredDiscoveryData, idB, 0, discoveryPayload(room, fakeIPv4(20, 0))), evil, tNow)
 	if a, _ := f.r.discSessions.lookup(idB, tNow); a != addrB {
-		t.Fatalf("legacy register hijacked secure binding: %s", a)
+		t.Fatalf("unauthenticated register moved B to %s", a)
 	}
-	if len(f.w.take()) != 0 || f.r.stats.dropUnauthenticated.Load() != 2 {
-		t.Fatalf("legacy spoof not refused: unauth=%d", f.r.stats.dropUnauthenticated.Load())
-	}
-	// Once the secure binding expires, a legacy client may use the ID again.
-	later := tNow.Add(f.r.lim.discSessionTTL)
-	f.r.handle(encodePacket(typDiscoveryRegister, idB, 0, nil), evil, later)
-	if a, _ := f.r.discSessions.lookup(idB, later); a != evil {
-		t.Fatal("expired secure binding still blocks legacy registration")
+	if len(f.w.take()) != 0 || f.r.stats.dropRetired.Load() != 2 {
+		t.Fatal("unauthenticated discovery not dropped")
 	}
 }
 
-func TestSecureDiscoveryMixedRoom(t *testing.T) {
-	f := newSecureFixture(t, authOptional)
-	// D is a legacy client in the same room.
-	const idD = 0xdddddddd
-	addrD := ap("192.0.2.4:21032")
-	f.rooms[room] = append(f.rooms[room], discPeer{id: idD})
-	f.r.handle(encodePacket(typDiscoveryRegister, idD, 0, nil), addrD, tNow)
-
-	// Authenticated sender: legacy D gets bare IPv4, B and C get 0x0C.
+func TestSecureDiscoveryRecipientsNeedKeys(t *testing.T) {
+	f := newSecureFixture(t)
+	// D is listed without a key (it never authenticated); it cannot have a
+	// discovery binding and receives nothing.
+	f.rooms[room] = append(f.rooms[room], discPeer{id: 0xdddddddd})
 	ip := fakeIPv4(20, 1)
 	f.r.handle(f.a.packet(room, ip, tNow), addrA, tNow)
 	out := f.w.take()
-	if len(out) != 3 {
-		t.Fatalf("fan-out = %d, want 3", len(out))
+	if len(out) != 2 {
+		t.Fatalf("fan-out = %d, want 2", len(out))
 	}
 	for _, s := range out {
-		if s.dst == addrD && !bytes.Equal(s.b, ip) {
-			t.Fatal("legacy recipient did not get bare IPv4")
+		if s.b[6]&sdiscFlagSenderVerified == 0 || bytes.Equal(s.b, ip) {
+			t.Fatal("delivery without verified flag, or bare IPv4")
 		}
 	}
 
-	// Legacy sender: secure recipients get 0x0C without the verified flag.
-	ip2 := fakeIPv4(20, 2)
-	f.r.handle(encodePacket(typDiscoveryData, idD, 0, discoveryPayload(room, ip2)), addrD, tNow)
-	out = f.w.take()
-	if len(out) != 3 { // A (now securely bound), B, C
-		t.Fatalf("legacy fan-out = %d, want 3", len(out))
-	}
-	for _, s := range out {
-		if s.dst == addrB {
-			flags, src, got := f.b.openDeliver(t, s.b)
-			if flags != 0 || src != idD || !bytes.Equal(got, ip2) {
-				t.Fatalf("legacy-origin deliver: flags=%x src=%08x", flags, src)
-			}
-		}
-	}
-
-	// A secure recipient whose key disappeared from the list is skipped,
-	// never downgraded to bare IPv4.
+	// A recipient whose key disappeared from the list gets nothing.
 	f.rooms[room][2] = discPeer{id: idC}
 	f.r.handle(f.a.packet(room, fakeIPv4(20, 3), tNow), addrA, tNow)
 	for _, s := range f.w.take() {
 		if s.dst == addrC {
-			t.Fatal("secure recipient without key received a packet")
+			t.Fatal("recipient without key received a packet")
 		}
 	}
 }
 
-func TestSecureDiscoveryRequiredMode(t *testing.T) {
-	f := newSecureFixture(t, authRequired)
-	f.r.handle(encodePacket(typDiscoveryRegister, 0xdddddddd, 0, nil), addrA, tNow)
-	f.r.handle(encodePacket(typDiscoveryData, idA, 0, discoveryPayload(room, fakeIPv4(20, 0))), addrA, tNow)
-	if len(f.w.take()) != 0 || f.r.stats.dropUnauthenticated.Load() != 2 || f.r.discSessions.len() != 2 {
-		t.Fatal("legacy discovery accepted in required mode")
-	}
-	f.r.handle(f.a.packet(room, fakeIPv4(20, 1), tNow), addrA, tNow)
-	if n := len(f.w.take()); n != 2 {
-		t.Fatalf("authenticated fan-out = %d, want 2", n)
-	}
-}
-
-func TestSecureDiscoveryOffAndMisc(t *testing.T) {
+func TestSecureDiscoveryMisc(t *testing.T) {
 	auth := newSdiscAuth(testKey(t, 0x77))
 	a := newTestDevice(t, idA, 0x0a, auth)
-	rooms := fakeSecureRooms{room: {a.peer(t, auth)}}
-
-	// auth off: secure types are unknown (3.0.x relays behave the same).
-	r, w := newTestRelay(t, testLimits(), rooms)
-	r.handle(a.packet(room, nil, tNow), addrA, tNow)
-	r.handle(a.packet(room, fakeIPv4(20, 0), tNow), addrA, tNow)
-	if len(w.take()) != 0 || r.stats.dropUnknownType.Load() != 2 || r.discSessions.len() != 0 {
-		t.Fatal("secure discovery handled with auth off")
-	}
-
-	r, _ = newTestRelay(t, authLimits(authOptional), fakeSecureRooms{room: {{id: idA}}})
+	r, _ := newTestRelay(t, authLimits(), fakeSecureRooms{room: {{id: idA}}})
 	// Member without a key cannot authenticate.
 	r.handle(a.packet(room, nil, tNow), addrA, tNow)
 	// Non-zero dst_id is malformed.
@@ -490,7 +446,11 @@ func TestSecureDiscoveryOffAndMisc(t *testing.T) {
 	r.handle(pkt, addrA, tNow)
 	// Unknown room.
 	r.handle(a.packet("space-other", nil, tNow), addrA, tNow)
-	if r.stats.dropAuthFailed.Load() != 1 || r.stats.dropMalformed.Load() != 1 || r.stats.dropRoomUnknown.Load() != 1 {
+	// Invalid sender ID.
+	bad := a.packet(room, nil, tNow)
+	binary.BigEndian.PutUint64(bad[7:15], 0)
+	r.handle(bad, addrA, tNow)
+	if r.stats.dropAuthFailed.Load() != 1 || r.stats.dropMalformed.Load() != 2 || r.stats.dropRoomUnknown.Load() != 1 {
 		t.Fatalf("counters: auth=%d malformed=%d room=%d",
 			r.stats.dropAuthFailed.Load(), r.stats.dropMalformed.Load(), r.stats.dropRoomUnknown.Load())
 	}
@@ -500,7 +460,7 @@ func TestSecureDiscoveryOffAndMisc(t *testing.T) {
 }
 
 func TestSecureStateReclaimed(t *testing.T) {
-	f := newSecureFixture(t, authOptional)
+	f := newSecureFixture(t)
 	if f.r.discReplay.len() != 2 {
 		t.Fatalf("replay entries = %d", f.r.discReplay.len())
 	}
@@ -548,7 +508,7 @@ func TestCoordinatorPeerFetcherPubKey(t *testing.T) {
 			base64.StdEncoding.EncodeToString(pub))
 	}))
 	defer srv.Close()
-	recs, err := coordinatorPeerFetcher(srv.URL, srv.Client())(context.Background(), room)
+	recs, err := coordinatorPeerFetcher(srv.URL, "", srv.Client())(context.Background(), room)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,31 +538,29 @@ func TestRelayKeyFile(t *testing.T) {
 }
 
 func TestConfigAuth(t *testing.T) {
-	cfg := defaultConfig()
-	if cfg.validate() != nil || cfg.authMode() != authOff {
-		t.Fatal("default must be valid with auth off")
-	}
 	for _, c := range []struct {
-		mut func(*Config)
-		ok  bool
+		name string
+		mut  func(*Config)
+		ok   bool
 	}{
-		{func(c *Config) { c.Discovery.Auth = "optional" }, true},
-		{func(c *Config) { c.Discovery.Auth = "required" }, true},
-		{func(c *Config) { c.Discovery.Auth = "yes" }, false},
-		{func(c *Config) { c.Discovery.Auth = "optional"; c.Discovery.AuthKeyFile = "" }, false},
-		{func(c *Config) { c.Discovery.Auth = "optional"; c.Discovery.AuthMaxClockSkew = 0 }, false},
-		{func(c *Config) { c.Discovery.Auth = "optional"; c.Discovery.AuthMaxClockSkew = 61 * time.Second }, false},
+		{"default", func(c *Config) {}, true},
+		{"empty auth", func(c *Config) { c.Discovery.Auth = "" }, true},
+		{"off retired", func(c *Config) { c.Discovery.Auth = "off" }, false},
+		{"optional retired", func(c *Config) { c.Discovery.Auth = "optional" }, false},
+		{"no key file", func(c *Config) { c.Discovery.AuthKeyFile = "" }, false},
+		{"no key file, discovery off", func(c *Config) { c.Discovery.AuthKeyFile, c.Discovery.Enabled = "", false }, true},
+		{"zero skew", func(c *Config) { c.Discovery.AuthMaxClockSkew = 0 }, false},
+		{"skew vs ttl", func(c *Config) { c.Discovery.AuthMaxClockSkew = 61 * time.Second }, false},
+		{"deprecated require_sender_in_room", func(c *Config) { c.Discovery.RequireSenderInRoom = false }, true},
 	} {
 		cfg := defaultConfig()
 		c.mut(cfg)
 		if err := cfg.validate(); (err == nil) != c.ok {
-			t.Errorf("auth=%q skew=%s: err=%v", cfg.Discovery.Auth, cfg.Discovery.AuthMaxClockSkew, err)
+			t.Errorf("%s: err=%v", c.name, err)
 		}
 	}
-	cfg = defaultConfig()
-	cfg.Discovery.Auth, cfg.Discovery.Enabled = "required", false
-	if cfg.authMode() != authOff {
-		t.Fatal("auth active with discovery disabled")
+	if defaultConfig().Discovery.Auth != "required" {
+		t.Fatal("default auth must be required")
 	}
 }
 
@@ -632,7 +590,7 @@ func BenchmarkSecureDiscoveryFanout(b *testing.B) {
 	auth := newSdiscAuth(testKey(b, 0x77))
 	sender := newTestDevice(b, 1, 1, auth)
 	peers := []discPeer{sender.peer(b, auth)}
-	r := newRelay(discardWriter{}, authLimits(authOptional), nil, &stats{})
+	r := newRelay(discardWriter{}, authLimits(), nil, &stats{})
 	const recipients = 32
 	for i := range recipients {
 		d := newTestDevice(b, uint64(i+2), byte(i+2), auth)
