@@ -28,7 +28,7 @@ func TestCoordinatorPeerFetcher(t *testing.T) {
 		fmt.Fprint(w, `[{"device_id":"device-a1b2c3d4","extra":1},{"device_id":"bogus"},{"device_id":"device-00000001"}]`)
 	}))
 	defer srv.Close()
-	fetch := coordinatorPeerFetcher(srv.URL+"/", "", srv.Client())
+	fetch := coordinatorPeerFetcher(srv.URL+"/", newRelayCreds(false, ""), srv.Client())
 
 	ids, err := fetch(context.Background(), "space-0a1b2c3d")
 	if err != nil {
@@ -61,10 +61,10 @@ func TestCoordinatorPeerFetcherSendsSecret(t *testing.T) {
 		fmt.Fprint(w, `[]`)
 	}))
 	defer srv.Close()
-	if _, err := coordinatorPeerFetcher(srv.URL, "s3cret", srv.Client())(context.Background(), "space-x"); err != nil {
+	if _, err := coordinatorPeerFetcher(srv.URL, newRelayCreds(false, "s3cret"), srv.Client())(context.Background(), "space-x"); err != nil {
 		t.Fatal(err)
 	}
-	_, err := coordinatorPeerFetcher(srv.URL, "wrong", srv.Client())(context.Background(), "space-x")
+	_, err := coordinatorPeerFetcher(srv.URL, newRelayCreds(false, "wrong"), srv.Client())(context.Background(), "space-x")
 	if err == nil || strings.Contains(err.Error(), "wrong") {
 		t.Fatalf("err = %v (must fail without echoing the secret)", err)
 	}
@@ -80,7 +80,7 @@ func TestCoordinatorPeerFetcherBodyLimit(t *testing.T) {
 		fmt.Fprint(w, `{"device_id":"device-a1b2c3d4"}]`)
 	}))
 	defer srv.Close()
-	if _, err := coordinatorPeerFetcher(srv.URL, "", srv.Client())(context.Background(), "space-x"); err == nil {
+	if _, err := coordinatorPeerFetcher(srv.URL, newRelayCreds(false, ""), srv.Client())(context.Background(), "space-x"); err == nil {
 		t.Fatal("oversized response accepted")
 	}
 }

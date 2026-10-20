@@ -5,9 +5,14 @@ client contract is `msst-net-core-31x/docs/RELAY_REQUIREMENTS_3.1.md`.
 3.0.x clients are not supported: plaintext data and unauthenticated
 discovery are retired.
 
+The same program runs as an **official** relay (default; listed in
+`GET /relays`) or as a **self-hosted** relay that rooms designate by its
+connection link ([SELF_HOSTED.md](SELF_HOSTED.md)).
+
 ```bash
 go build -o msstnetRelay31x .
 ./msstnetRelay31x -config config.yaml   # creates a default config (mode 0600) if missing
+./msstnetRelay31x -config config.yaml -print-link   # print the connection link and exit
 go vet ./... && go test -race ./...
 ```
 
@@ -21,7 +26,7 @@ processing (preserves per-flow ordering). Header: `"MSST"|ver=1|type|flags|src_i
 | 0x01 register, 0x02 keepalive | bind `src_id` → source address | ID in `1..0xFFFFFFFF`; address not unspecified/multicast/broadcast; table cap. `register_auth: optional`: refused for an ID with a live 0x0E binding; `required`: dropped |
 | 0x0E sreg (authenticated register/keepalive) | bind `src_id` → source address, marked authenticated | device key from the Coordinator (cached; miss → drop + fetch); tag; counter. See [REGISTRATION_AUTH.md](REGISTRATION_AUTH.md) |
 | 0x05 ping | echo datagram to sender | ≤ 64 bytes; global rate limit |
-| 0x0D WireGuard | forward **whole datagram unchanged** to `dst_id` | dst registered and not expired; payload ≥ 32 (smallest WireGuard message); dst ≠ src. Sender need not be registered here |
+| 0x0D WireGuard | forward **whole datagram unchanged** to `dst_id` | dst registered and not expired; payload ≥ 32 (smallest WireGuard message); dst ≠ src. Official: sender need not be registered here. Self-hosted: `src_id` must be registered at the source address (`drop{unregistered_src}`) |
 | 0x0A / 0x0B sdisc register / data | authenticate, bind discovery address / fan out as 0x0C | see below and [SECURE_DISCOVERY.md](SECURE_DISCOVERY.md) |
 | 0x03, 0x04, 0x06, 0x07, 0x08, 0x09 (retired) | drop | counted as `drop{retired}`. 0x06/0x07 are client-to-client only; the relay-path RTT is measured inside the tunnel (0x0D) |
 
@@ -62,19 +67,22 @@ global egress budget. No bare IPv4 is ever sent.
   (IP spoofing) and last until the bindings expire (`session_ttl`). With
   `register_auth: required` such registrations need the device's private
   key.
-- Data senders are not required to be registered: clients deliberately send
-  via the *destination's* relay.
+- Data senders are not required to be registered at an official relay:
+  clients deliberately send via the *destination's* relay. A self-hosted
+  relay forwards only from senders registered with it by 0x0E.
 
 ## Coordinator interface
 
 - `POST /relay/register {id,region,addr,pub_key,features}` (`pub_key`: the
   relay key for sdisc and sreg; `features`: `["sdisc1","sreg1"]`), `POST /relay/heartbeat {id}` every
   `heartbeat_interval` (10 s; Coordinator expires relays after 30 s), with
-  `X-Relay-Secret: <control.relay_secret>` when set. 401 → secret mismatch;
+  `X-Relay-Secret: <control.relay_secret>` (this relay's own secret) when set. 401 → secret mismatch;
   404 on heartbeat → re-register. Backoff 5 s → 5 min with jitter.
 - `GET /room/{id}/discovery-peers` with `X-Relay-Secret`: `[{device_id, pub_key}]`.
 - `POST /relay/device-keys {device_ids:[…≤256]}` with `X-Relay-Secret`:
-  `[{device_id, pub_key}]`, for 0x0E (not yet in the Coordinator).
+  `[{device_id, pub_key}]`, for 0x0E.
+- Self-hosted mode replaces the secret with challenge-response registration
+  and a bearer token; see [SELF_HOSTED.md](SELF_HOSTED.md).
 - Forwarding never depends on the Coordinator being reachable. Discovery
   needs the peer list, and a device's *first* 0x0E needs its key (cached keys
   are served for `device_key_stale_ttl` during outages).
@@ -94,7 +102,10 @@ but ignored, because senders must always be room members; so are
 | `relay.max_sessions` | 65536 | bounded state |
 | `relay.session_ttl` | 120s | client keepalive is 5–30 s (default 25 s) |
 | `relay.ping_rate/burst` | 2000/4000 | bounds reflection to spoofed sources |
-| `relay.register_auth` | optional | `optional` / `required` (unauthenticated 0x01/0x02) |
+| `relay.register_auth` | optional | `optional` / `required` (unauthenticated 0x01/0x02); must be `required` when self-hosted |
+| `relay.mode` | official | `official` / `self_hosted` ([SELF_HOSTED.md](SELF_HOSTED.md)) |
+| `relay.password` | (none) | self-hosted only; room owners must give it to designate the relay |
+| `relay.require_room_password` | true | self-hosted only; Coordinator refuses rooms without a room password |
 | `relay.device_key_ttl` / `_stale_ttl` | 10m / 1h | sreg key refresh / serve during Coordinator outage |
 | `relay.device_key_max_entries` | 65536 | cached device keys |
 | `discovery.session_ttl` | 120s | client re-registers every 25 s |

@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -69,6 +71,19 @@ type RelayConfig struct {
 	DeviceKeyTTL        time.Duration `yaml:"device_key_ttl"`
 	DeviceKeyStaleTTL   time.Duration `yaml:"device_key_stale_ttl"`
 	DeviceKeyMaxEntries int           `yaml:"device_key_max_entries"`
+
+	// Mode is "official" (default: listed in GET /relays, authenticates with
+	// control.relay_secret) or "self_hosted" (not listed; rooms designate it
+	// by its connection link; authenticates with the relay key). See
+	// SELF_HOSTED.md.
+	Mode string `yaml:"mode"`
+	// Password (self-hosted, optional) must be given by room owners who
+	// designate this relay. Only an Argon2id verifier leaves this machine.
+	// Keep the config file mode 0600.
+	Password string `yaml:"password,omitempty"`
+	// RequireRoomPassword (self-hosted): the Coordinator refuses rooms that
+	// designate this relay but have no room password.
+	RequireRoomPassword bool `yaml:"require_room_password"`
 }
 
 type DiscoveryConfig struct {
@@ -120,8 +135,8 @@ type ControlConfig struct {
 	// ServerURL is the Coordinator base URL. Empty disables registration and
 	// discovery peer lookups; data forwarding works regardless.
 	ServerURL string `yaml:"server_url"`
-	// RelaySecret is sent as X-Relay-Secret on /relay/register and
-	// /relay/heartbeat; it must match the Coordinator's relay_secret.
+	// RelaySecret is this official relay's pre-shared secret, sent as
+	// X-Relay-Secret to the Coordinator. Must be empty in self-hosted mode.
 	RelaySecret       string        `yaml:"relay_secret"`
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
 	RequestTimeout    time.Duration `yaml:"request_timeout"`
@@ -146,6 +161,8 @@ func defaultConfig() *Config {
 			DeviceKeyTTL:        10 * time.Minute,
 			DeviceKeyStaleTTL:   time.Hour,
 			DeviceKeyMaxEntries: 65536,
+			Mode:                relayModeOfficial,
+			RequireRoomPassword: true,
 		},
 		Discovery: DiscoveryConfig{
 			Enabled:             true,
@@ -293,6 +310,16 @@ func (c *Config) validate() error {
 	if c.Relay.DeviceKeyStaleTTL < c.Relay.DeviceKeyTTL {
 		bad("relay.device_key_stale_ttl must be >= relay.device_key_ttl")
 	}
+	switch c.Relay.Mode {
+	case relayModeOfficial, "":
+		if c.Relay.Password != "" {
+			bad("relay.password is only used in self_hosted mode")
+		}
+	case relayModeSelfHosted:
+		c.validateSelfHosted(bad)
+	default:
+		bad("relay.mode %q: want %q or %q", c.Relay.Mode, relayModeOfficial, relayModeSelfHosted)
+	}
 	if c.Log.StatsInterval < 0 {
 		bad("log.stats_interval must be >= 0")
 	}
@@ -301,7 +328,7 @@ func (c *Config) validate() error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			bad("control.server_url %q must be an http(s) URL", c.Control.ServerURL)
 		}
-		if c.Node.ID == "" || c.Node.Region == "" || c.Node.Addr == "" {
+		if !c.selfHosted() && (c.Node.ID == "" || c.Node.Region == "" || c.Node.Addr == "") {
 			bad("node.id, node.region and node.addr are required when control.server_url is set")
 		}
 		if c.Control.HeartbeatInterval >= 30*time.Second {
@@ -311,6 +338,42 @@ func (c *Config) validate() error {
 	return errors.Join(errs...)
 }
 
+// validateSelfHosted checks the self-hosted requirements (RR1, RR2).
+func (c *Config) validateSelfHosted(bad func(string, ...any)) {
+	if u, err := url.Parse(c.Control.ServerURL); err != nil || u.Scheme != "https" || u.Host == "" {
+		bad("relay.mode self_hosted requires an https control.server_url")
+	}
+	if c.Control.RelaySecret != "" {
+		// Official secrets must not end up on third-party machines.
+		bad("control.relay_secret must be empty in self_hosted mode (the relay key authenticates it)")
+	}
+	if m, err := parseRegAuthMode(c.Relay.RegisterAuth); err == nil && m != regAuthRequired {
+		// Otherwise anyone could register with 0x01 and use the relay
+		// without the relay password.
+		bad("relay.register_auth must be required in self_hosted mode")
+	}
+	if err := checkHostPort(c.Node.Addr); err != nil {
+		bad("node.addr %q: %v (the public host:port in the connection link)", c.Node.Addr, err)
+	}
+}
+
+// checkHostPort accepts host:port with a non-empty host and a port 1–65535.
+func checkHostPort(s string) error {
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return err
+	}
+	if host == "" || strings.ContainsAny(host, "/?#@ ") {
+		return errors.New("invalid host")
+	}
+	if n, err := strconv.ParseUint(port, 10, 16); err != nil || n == 0 {
+		return errors.New("invalid port")
+	}
+	return nil
+}
+
+func (c *Config) selfHosted() bool { return c.Relay.Mode == relayModeSelfHosted }
+
 // regAuthMode returns the parsed relay.register_auth. Call after validate.
 func (c *Config) regAuthMode() regAuthMode {
 	m, _ := parseRegAuthMode(c.Relay.RegisterAuth)
@@ -319,25 +382,26 @@ func (c *Config) regAuthMode() regAuthMode {
 
 func (c *Config) limits() relayLimits {
 	return relayLimits{
-		maxSessions:         c.Relay.MaxSessions,
-		sessionTTL:          c.Relay.SessionTTL,
-		pingRate:            c.Relay.PingRate,
-		pingBurst:           c.Relay.PingBurst,
-		regAuth:             c.regAuthMode(),
-		discoveryEnabled:    c.Discovery.Enabled,
-		discMaxSessions:     c.Discovery.MaxSessions,
-		discSessionTTL:      c.Discovery.SessionTTL,
-		discSenderRate:      c.Discovery.SenderRate,
-		discSenderBurst:     c.Discovery.SenderBurst,
-		discMaxSenders:      c.Discovery.MaxSenders,
-		discIngressRate:     c.Discovery.IngressRate,
-		discIngressBurst:    c.Discovery.IngressBurst,
-		discEgressRate:      c.Discovery.EgressRate,
-		discEgressBurst:     c.Discovery.EgressBurst,
-		discDedupTTL:        c.Discovery.DedupTTL,
-		discDedupMax:        c.Discovery.DedupMaxEntries,
-		discMaxFanout:       c.Discovery.MaxFanout,
-		authSkew:            c.Discovery.AuthMaxClockSkew,
-		maintenanceInterval: 5 * time.Second,
+		maxSessions:          c.Relay.MaxSessions,
+		sessionTTL:           c.Relay.SessionTTL,
+		pingRate:             c.Relay.PingRate,
+		pingBurst:            c.Relay.PingBurst,
+		regAuth:              c.regAuthMode(),
+		discoveryEnabled:     c.Discovery.Enabled,
+		discMaxSessions:      c.Discovery.MaxSessions,
+		discSessionTTL:       c.Discovery.SessionTTL,
+		discSenderRate:       c.Discovery.SenderRate,
+		discSenderBurst:      c.Discovery.SenderBurst,
+		discMaxSenders:       c.Discovery.MaxSenders,
+		discIngressRate:      c.Discovery.IngressRate,
+		discIngressBurst:     c.Discovery.IngressBurst,
+		discEgressRate:       c.Discovery.EgressRate,
+		discEgressBurst:      c.Discovery.EgressBurst,
+		discDedupTTL:         c.Discovery.DedupTTL,
+		discDedupMax:         c.Discovery.DedupMaxEntries,
+		discMaxFanout:        c.Discovery.MaxFanout,
+		authSkew:             c.Discovery.AuthMaxClockSkew,
+		requireRegisteredSrc: c.selfHosted(),
+		maintenanceInterval:  5 * time.Second,
 	}
 }

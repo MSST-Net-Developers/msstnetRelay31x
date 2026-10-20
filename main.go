@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -20,7 +21,17 @@ const maxDatagram = 65535
 
 func main() {
 	configPath := flag.String("config", defaultConfigFile, "path to config file")
+	printLink := flag.Bool("print-link", false, "print the relay connection link and exit")
 	flag.Parse()
+
+	if *printLink {
+		link, err := linkFromConfig(*configPath)
+		if err != nil {
+			log.Fatalf("print-link: %v", err)
+		}
+		fmt.Println(link)
+		return
+	}
 
 	cfg, err := loadOrCreateConfig(*configPath)
 	if err != nil {
@@ -59,7 +70,13 @@ func main() {
 		log.Fatalf("relay key: %v", err)
 	}
 	auth := newSdiscAuth(priv)
-	log.Printf("relay public key %s; register_auth=%s", auth.publicKeyBase64(), cfg.Relay.RegisterAuth)
+	log.Printf("relay public key %s; mode=%s register_auth=%s", auth.publicKeyBase64(), cfg.Relay.Mode, cfg.Relay.RegisterAuth)
+	if cfg.selfHosted() {
+		log.Printf("connection link: %s", relayLink(cfg.Node.Addr, auth.pub, cfg.Relay.Password != ""))
+		if cfg.Relay.Password != "" {
+			warnIfReadable(*configPath, "config (holds relay.password)")
+		}
+	}
 	if cfg.Relay.ProbeRate != 0 || cfg.Relay.ProbeBurst != 0 {
 		log.Printf("relay.probe_rate/probe_burst are deprecated and ignored; 0x06/0x07 are no longer forwarded")
 	}
@@ -70,18 +87,18 @@ func main() {
 	var rooms roomPeerLookup
 	var regKeys regKeyLookup
 	if cfg.Control.ServerURL != "" {
-		cc := newControlClient(cfg)
-		cc.pubKey = auth.publicKeyBase64()
+		creds := newRelayCreds(cfg.selfHosted(), cfg.Control.RelaySecret)
+		cc := newControlClient(cfg, creds, auth)
 		wg.Go(func() { cc.run(ctx) })
 
-		kc := newRegKeyCache(coordinatorKeyFetcher(cfg.Control.ServerURL, cfg.Control.RelaySecret, &http.Client{Timeout: 5 * time.Second}),
+		kc := newRegKeyCache(coordinatorKeyFetcher(cfg.Control.ServerURL, creds, &http.Client{Timeout: 5 * time.Second}),
 			auth, cfg.Relay.DeviceKeyMaxEntries, cfg.Relay.DeviceKeyTTL, cfg.Relay.DeviceKeyStaleTTL)
 		wg.Go(func() { kc.run(ctx, 5*time.Second) })
 		regKeys = kc
 
 		if cfg.Discovery.Enabled {
 			httpc := &http.Client{Timeout: 3 * time.Second}
-			rc := newRoomCache(coordinatorPeerFetcher(cfg.Control.ServerURL, cfg.Control.RelaySecret, httpc), auth,
+			rc := newRoomCache(coordinatorPeerFetcher(cfg.Control.ServerURL, creds, httpc), auth,
 				cfg.Discovery.RoomCacheMaxEntries, cfg.Discovery.RoomCacheTTL, cfg.Discovery.RoomCacheStaleTTL)
 			for range roomFetchWorkers {
 				wg.Go(func() { rc.run(ctx, 3*time.Second) })
@@ -109,6 +126,36 @@ func main() {
 	wg.Wait()
 	st.report()
 	log.Printf("relay stopped")
+}
+
+// linkFromConfig returns the connection link for an existing config: the
+// address in node.addr and the relay key (created if missing, as on start).
+func linkFromConfig(path string) (string, error) {
+	if _, err := os.Stat(path); err != nil {
+		return "", err
+	}
+	cfg, err := loadOrCreateConfig(path)
+	if err != nil {
+		return "", err
+	}
+	if err := cfg.validate(); err != nil {
+		return "", fmt.Errorf("config %s: %w", path, err)
+	}
+	if err := checkHostPort(cfg.Node.Addr); err != nil {
+		return "", fmt.Errorf("node.addr %q: %w", cfg.Node.Addr, err)
+	}
+	priv, err := loadOrCreateRelayKey(cfg.Discovery.AuthKeyFile)
+	if err != nil {
+		return "", err
+	}
+	return relayLink(cfg.Node.Addr, newSdiscAuth(priv).pub, cfg.Relay.Password != ""), nil
+}
+
+// warnIfReadable logs a warning if path is accessible by group or others.
+func warnIfReadable(path, what string) {
+	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm()&0o077 != 0 {
+		log.Printf("warning: %s %s is accessible by group/others (mode %v); use 0600", what, path, fi.Mode().Perm())
+	}
 }
 
 // serve runs the read loop until conn is closed. Packets are processed

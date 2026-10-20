@@ -70,6 +70,11 @@ type peerRecord struct {
 
 type peerFetcher func(ctx context.Context, roomID string) ([]peerRecord, error)
 
+// errRoomForbidden: the Coordinator does not let this (self-hosted) relay
+// read the room, because the room did not designate it. The room is treated
+// as having no peers until the next refresh.
+var errRoomForbidden = errors.New("room not served by this relay")
+
 // roomCache is shared between the read loop (lookups) and fetch workers
 // (updates), so it is guarded by mu. No I/O happens while mu is held.
 type roomCache struct {
@@ -206,10 +211,17 @@ func (c *roomCache) complete(roomID string, list []discPeer, err error, now time
 		return // swept meanwhile
 	}
 	e.refreshing = false
+	if errors.Is(err, errRoomForbidden) {
+		// Stop serving any earlier list (e.g. the room was dissolved and its
+		// ID reused); attemptAt spaces out retries by ttl. Not logged: any
+		// client can trigger it with a room ID.
+		e.peers = nil
+		return
+	}
 	if err != nil {
 		// Keep serving the previous list until it goes stale; attemptAt
 		// (set at enqueue) spaces out retries by ttl.
-		if !errors.Is(err, context.Canceled) {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, errNoToken) {
 			log.Printf("discovery: fetch peers for room %s: %v", roomID, err)
 		}
 		return
@@ -238,8 +250,10 @@ func (c *roomCache) sweep(now time.Time) {
 // Each item also carries "pub_key" (base64 X25519, as bound at device
 // registration); peers without a valid key cannot use discovery. The
 // endpoint lists room members and their keys, so the Coordinator requires
-// X-Relay-Secret when it has relay_secret set.
-func coordinatorPeerFetcher(base, secret string, client *http.Client) peerFetcher {
+// relay credentials (creds). A self-hosted relay may only read rooms that
+// designated it; for other rooms the Coordinator returns 403
+// (errRoomForbidden).
+func coordinatorPeerFetcher(base string, creds *relayCreds, client *http.Client) peerFetcher {
 	base = strings.TrimRight(base, "/")
 	return func(ctx context.Context, roomID string) ([]peerRecord, error) {
 		if !validRoomID(roomID) {
@@ -250,8 +264,9 @@ func coordinatorPeerFetcher(base, secret string, client *http.Client) peerFetche
 		if err != nil {
 			return nil, err
 		}
-		if secret != "" {
-			req.Header.Set("X-Relay-Secret", secret)
+		tok, err := creds.apply(req)
+		if err != nil {
+			return nil, err
 		}
 		resp, err := client.Do(req)
 		if err != nil {
@@ -260,8 +275,12 @@ func coordinatorPeerFetcher(base, secret string, client *http.Client) peerFetche
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-			if resp.StatusCode == http.StatusUnauthorized {
-				return nil, fmt.Errorf("coordinator returned %s (check control.relay_secret)", resp.Status)
+			switch {
+			case resp.StatusCode == http.StatusUnauthorized:
+				creds.unauthorized(tok)
+				return nil, fmt.Errorf("coordinator returned %s (%s)", resp.Status, creds.unauthorizedHint())
+			case resp.StatusCode == http.StatusForbidden && creds.selfHosted:
+				return nil, errRoomForbidden
 			}
 			return nil, fmt.Errorf("coordinator returned %s", resp.Status)
 		}

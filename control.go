@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,17 +20,27 @@ import (
 // with heartbeats (Coordinator relay.go: POST /relay/register,
 // POST /relay/heartbeat; relays expire after 30 s without a heartbeat).
 //
+// Official relays authenticate with their pre-shared secret
+// (control.relay_secret). Self-hosted relays prove possession of the relay
+// key (POST /relay/self-hosted/challenge, /relay/self-hosted/register) and
+// heartbeat with the bearer token they get back (selfhosted.go).
+//
 // Forwarding never depends on the Coordinator being reachable; this only
-// affects whether clients are offered this relay via GET /relays.
+// affects whether clients are offered this relay (official: GET /relays;
+// self-hosted: whether rooms can designate it).
 type controlClient struct {
 	serverURL string
 	id        string
 	region    string
 	addr      string
-	secret    string
-	pubKey    string // relay public key (base64) for sdisc and sreg
+	creds     *relayCreds
+	auth      *sdiscAuth // relay key; nil only in tests of official mode
 	interval  time.Duration
 	http      *http.Client
+
+	// Self-hosted only. pwVerifier is nil without relay.password.
+	pwVerifier          []byte
+	requireRoomPassword bool
 
 	retryInitial time.Duration
 	retryMax     time.Duration
@@ -38,21 +50,34 @@ type controlClient struct {
 // relay (typically because it restarted).
 var errNotRegistered = errors.New("relay not registered with coordinator")
 
-func newControlClient(cfg *Config) *controlClient {
-	return &controlClient{
-		serverURL:    strings.TrimRight(cfg.Control.ServerURL, "/"),
-		id:           cfg.Node.ID,
-		region:       cfg.Node.Region,
-		addr:         cfg.Node.Addr,
-		secret:       cfg.Control.RelaySecret,
-		interval:     cfg.Control.HeartbeatInterval,
-		http:         &http.Client{Timeout: cfg.Control.RequestTimeout},
-		retryInitial: 5 * time.Second,
-		retryMax:     5 * time.Minute,
+const (
+	maxControlRespBytes = 64 << 10
+	maxTokenLen         = 512
+)
+
+func newControlClient(cfg *Config, creds *relayCreds, auth *sdiscAuth) *controlClient {
+	c := &controlClient{
+		serverURL:           strings.TrimRight(cfg.Control.ServerURL, "/"),
+		id:                  cfg.Node.ID,
+		region:              cfg.Node.Region,
+		addr:                cfg.Node.Addr,
+		creds:               creds,
+		auth:                auth,
+		interval:            cfg.Control.HeartbeatInterval,
+		http:                &http.Client{Timeout: cfg.Control.RequestTimeout},
+		requireRoomPassword: cfg.Relay.RequireRoomPassword,
+		retryInitial:        5 * time.Second,
+		retryMax:            5 * time.Minute,
 	}
+	if creds.selfHosted && cfg.Relay.Password != "" {
+		c.pwVerifier = relayPasswordVerifier(cfg.Relay.Password, auth.pub)
+	}
+	return c
 }
 
-func (c *controlClient) post(ctx context.Context, path string, body any) error {
+// post sends body as JSON and decodes a 2xx JSON response into out (if not
+// nil). bearer, when set, overrides the configured credentials.
+func (c *controlClient) post(ctx context.Context, path string, body, out any, bearer string) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -62,24 +87,51 @@ func (c *controlClient) post(ctx context.Context, path string, body any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.secret != "" {
-		req.Header.Set("X-Relay-Secret", c.secret)
+	switch {
+	case bearer != "":
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	case !c.creds.selfHosted:
+		_, _ = c.creds.apply(req)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	switch {
-	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+	lr := io.LimitReader(resp.Body, maxControlRespBytes)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if out == nil {
+			_, _ = io.Copy(io.Discard, lr)
+			return nil
+		}
+		if err := json.NewDecoder(lr).Decode(out); err != nil {
+			return fmt.Errorf("parse %s response: %w", path, err)
+		}
 		return nil
-	case resp.StatusCode == http.StatusUnauthorized:
-		return fmt.Errorf("coordinator returned %s (check control.relay_secret)", resp.Status)
+	}
+	// Coordinator errors are {"error": "...", "code": "..."}; code is
+	// optional. Only these two fields are logged.
+	var e struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	_ = json.NewDecoder(lr).Decode(&e)
+	detail := ""
+	if e.Code != "" {
+		detail = " code=" + e.Code
+	}
+	if e.Error != "" {
+		detail += fmt.Sprintf(" (%.200s)", e.Error)
+	}
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized && !c.creds.selfHosted:
+		return fmt.Errorf("coordinator returned %s%s (check control.relay_secret)", resp.Status, detail)
+	case resp.StatusCode == http.StatusUnauthorized && path == "/relay/heartbeat":
+		return errNotRegistered // token expired or Coordinator restarted
 	case resp.StatusCode == http.StatusNotFound && path == "/relay/heartbeat":
 		return errNotRegistered
 	default:
-		return fmt.Errorf("coordinator returned %s", resp.Status)
+		return fmt.Errorf("coordinator returned %s%s", resp.Status, detail)
 	}
 }
 
@@ -89,7 +141,11 @@ func (c *controlClient) post(ctx context.Context, path string, body any) error {
 // reply, so clients cannot detect support any other way.
 var relayFeatures = []string{"sdisc1", "sreg1"}
 
-func (c *controlClient) register(ctx context.Context) error {
+// register registers once and returns a description for the log.
+func (c *controlClient) register(ctx context.Context) (string, error) {
+	if c.creds.selfHosted {
+		return c.registerSelfHosted(ctx)
+	}
 	body := map[string]any{
 		"id":     c.id,
 		"region": c.region,
@@ -97,15 +153,78 @@ func (c *controlClient) register(ctx context.Context) error {
 	}
 	// Clients need this key (via GET /relays) for secure discovery and
 	// authenticated registration with this relay.
-	if c.pubKey != "" {
-		body["pub_key"] = c.pubKey
+	if c.auth != nil {
+		body["pub_key"] = c.auth.publicKeyBase64()
 		body["features"] = relayFeatures
 	}
-	return c.post(ctx, "/relay/register", body)
+	if err := c.post(ctx, "/relay/register", body, nil, ""); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("id=%s region=%s addr=%s", c.id, c.region, c.addr), nil
+}
+
+// registerSelfHosted performs challenge-response registration and stores the
+// returned token in creds. The token is never logged.
+func (c *controlClient) registerSelfHosted(ctx context.Context) (string, error) {
+	pub := c.auth.publicKeyBase64()
+	var ch struct {
+		ChallengeID string `json:"challenge_id"`
+		ServerPub   string `json:"server_pub"`
+	}
+	if err := c.post(ctx, "/relay/self-hosted/challenge", map[string]string{"pub_key": pub}, &ch, ""); err != nil {
+		return "", fmt.Errorf("challenge: %w", err)
+	}
+	cid, err := hex.DecodeString(ch.ChallengeID)
+	if err != nil || len(cid) != 16 || ch.ChallengeID != strings.ToLower(ch.ChallengeID) {
+		return "", errors.New("challenge: invalid challenge_id")
+	}
+	spub, err := base64.StdEncoding.DecodeString(ch.ServerPub)
+	if err != nil || len(spub) != 32 {
+		return "", errors.New("challenge: invalid server_pub")
+	}
+	mac, err := c.auth.relayKeyproofMAC([32]byte(spub), [16]byte(cid))
+	if err != nil {
+		return "", fmt.Errorf("challenge: %w", err)
+	}
+	body := map[string]any{
+		"pub_key":               pub,
+		"addr":                  c.addr,
+		"features":              relayFeatures,
+		"require_room_password": c.requireRoomPassword,
+		"proof": map[string]string{
+			"challenge_id": ch.ChallengeID,
+			"mac":          base64.StdEncoding.EncodeToString(mac[:]),
+		},
+	}
+	if c.pwVerifier != nil {
+		body["password_verifier"] = base64.StdEncoding.EncodeToString(c.pwVerifier)
+	}
+	var reg struct {
+		RelayID string `json:"relay_id"`
+		Token   string `json:"token"`
+	}
+	if err := c.post(ctx, "/relay/self-hosted/register", body, &reg, ""); err != nil {
+		return "", fmt.Errorf("register: %w", err)
+	}
+	if reg.Token == "" || len(reg.Token) > maxTokenLen {
+		return "", errors.New("register: invalid token in response")
+	}
+	c.creds.setToken(reg.Token)
+	return fmt.Sprintf("self-hosted relay_id=%.40q addr=%s password=%v require_room_password=%v",
+		reg.RelayID, c.addr, c.pwVerifier != nil, c.requireRoomPassword), nil
 }
 
 func (c *controlClient) heartbeat(ctx context.Context) error {
-	return c.post(ctx, "/relay/heartbeat", map[string]string{"id": c.id})
+	if !c.creds.selfHosted {
+		return c.post(ctx, "/relay/heartbeat", map[string]string{"id": c.id}, nil, "")
+	}
+	c.creds.mu.Lock()
+	tok := c.creds.token
+	c.creds.mu.Unlock()
+	if tok == "" {
+		return errNotRegistered
+	}
+	return c.post(ctx, "/relay/heartbeat", map[string]string{}, nil, tok)
 }
 
 // registerWithRetry retries with capped exponential backoff and jitter until
@@ -113,9 +232,9 @@ func (c *controlClient) heartbeat(ctx context.Context) error {
 func (c *controlClient) registerWithRetry(ctx context.Context) bool {
 	delay := c.retryInitial
 	for {
-		err := c.register(ctx)
+		desc, err := c.register(ctx)
 		if err == nil {
-			log.Printf("control: registered id=%s region=%s addr=%s", c.id, c.region, c.addr)
+			log.Printf("control: registered %s", desc)
 			return true
 		}
 		if ctx.Err() != nil {
@@ -132,9 +251,11 @@ func (c *controlClient) registerWithRetry(ctx context.Context) bool {
 
 // run registers, then heartbeats every interval. A failed heartbeat is
 // followed by re-registration (register is idempotent on the Coordinator),
-// which also covers a Coordinator restart. Returns when ctx is cancelled.
+// which also covers a Coordinator restart. A self-hosted relay also
+// re-registers when another request was rejected with its token. Returns
+// when ctx is cancelled.
 func (c *controlClient) run(ctx context.Context) {
-	if strings.HasPrefix(c.serverURL, "http://") && c.secret != "" {
+	if strings.HasPrefix(c.serverURL, "http://") && c.creds.secret != "" {
 		log.Printf("control: warning: relay_secret is sent over plain HTTP to %s", c.serverURL)
 	}
 	for {
@@ -147,6 +268,10 @@ func (c *controlClient) run(ctx context.Context) {
 			case <-ctx.Done():
 				ticker.Stop()
 				return
+			case <-c.creds.reauth:
+				err = errNotRegistered
+				log.Printf("control: coordinator rejected the relay token; re-registering")
+				continue
 			case <-ticker.C:
 			}
 			if err = c.heartbeat(ctx); err != nil && ctx.Err() == nil {

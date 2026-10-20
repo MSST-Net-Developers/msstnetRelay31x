@@ -32,17 +32,18 @@ type stats struct {
 	sendErrors         atomic.Uint64
 
 	// Drops.
-	dropMalformed     atomic.Uint64 // framing / field validation
-	dropVersion       atomic.Uint64
-	dropUnknownType   atomic.Uint64
-	dropRetired       atomic.Uint64 // retired types 0x03/0x04/0x06/0x07/0x08/0x09
-	dropUnknownDst    atomic.Uint64 // destination not registered or expired
-	dropUnverifiedSrc atomic.Uint64 // P2P ping whose src_id is not bound to its source address
-	dropLoop          atomic.Uint64 // destination equals source
-	dropRateLimited   atomic.Uint64
-	dropDuplicate     atomic.Uint64 // discovery dedup
-	dropRoomUnknown   atomic.Uint64 // discovery: room peers not (yet) known
-	dropNotInRoom     atomic.Uint64 // discovery: sender not registered in room
+	dropMalformed       atomic.Uint64 // framing / field validation
+	dropVersion         atomic.Uint64
+	dropUnknownType     atomic.Uint64
+	dropRetired         atomic.Uint64 // retired types 0x03/0x04/0x06/0x07/0x08/0x09
+	dropUnknownDst      atomic.Uint64 // destination not registered or expired
+	dropUnverifiedSrc   atomic.Uint64 // discovery sender's binding not stored (table full)
+	dropLoop            atomic.Uint64 // destination equals source
+	dropUnregisteredSrc atomic.Uint64 // self-hosted: 0x0D whose src_id is not registered at its source address
+	dropRateLimited     atomic.Uint64
+	dropDuplicate       atomic.Uint64 // discovery dedup
+	dropRoomUnknown     atomic.Uint64 // discovery: room peers not (yet) known
+	dropNotInRoom       atomic.Uint64 // discovery: sender not registered in room
 
 	// Secure discovery.
 	dropAuthFailed atomic.Uint64 // no key for the claimed sender, or bad tag
@@ -56,13 +57,13 @@ func (s *stats) report() {
 	log.Printf("stats: sessions=%d discovery_sessions=%d rx=%d data_fwd=%d ping_echo=%d disc_fwd=%d "+
 		"send_err=%d reg_new=%d rebind=%d reg_full=%d reg_invalid=%d "+
 		"reg_drop{unauth=%d key_unknown=%d auth=%d replay=%d} "+
-		"drop{malformed=%d version=%d type=%d retired=%d unknown_dst=%d unverified_src=%d loop=%d rate=%d dup=%d room_unknown=%d not_in_room=%d auth=%d replay=%d}",
+		"drop{malformed=%d version=%d type=%d retired=%d unknown_dst=%d unverified_src=%d unregistered_src=%d loop=%d rate=%d dup=%d room_unknown=%d not_in_room=%d auth=%d replay=%d}",
 		s.sessions.Load(), s.discoverySessions.Load(), s.rxPackets.Load(),
 		s.dataForwarded.Load(), s.pingsEchoed.Load(), s.discoveryForwarded.Load(),
 		s.sendErrors.Load(), s.registrations.Load(), s.rebinds.Load(), s.sessionsFull.Load(), s.invalidRegistrant.Load(),
 		s.dropUnauthRegister.Load(), s.dropRegKeyUnknown.Load(), s.dropRegAuth.Load(), s.dropRegReplay.Load(),
 		s.dropMalformed.Load(), s.dropVersion.Load(), s.dropUnknownType.Load(), s.dropRetired.Load(), s.dropUnknownDst.Load(),
-		s.dropUnverifiedSrc.Load(), s.dropLoop.Load(), s.dropRateLimited.Load(), s.dropDuplicate.Load(),
+		s.dropUnverifiedSrc.Load(), s.dropUnregisteredSrc.Load(), s.dropLoop.Load(), s.dropRateLimited.Load(), s.dropDuplicate.Load(),
 		s.dropRoomUnknown.Load(), s.dropNotInRoom.Load(),
 		s.dropAuthFailed.Load(), s.dropReplay.Load())
 }

@@ -508,7 +508,7 @@ func TestCoordinatorPeerFetcherPubKey(t *testing.T) {
 			base64.StdEncoding.EncodeToString(pub))
 	}))
 	defer srv.Close()
-	recs, err := coordinatorPeerFetcher(srv.URL, "", srv.Client())(context.Background(), room)
+	recs, err := coordinatorPeerFetcher(srv.URL, newRelayCreds(false, ""), srv.Client())(context.Background(), room)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,15 +571,15 @@ func TestControlReportsPubKey(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := testControlClient(srv.URL, "")
-	if err := c.register(context.Background()); err != nil {
+	if _, err := c.register(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := body["pub_key"]; ok {
-		t.Fatal("pub_key sent with auth off")
+		t.Fatal("pub_key sent without a relay key")
 	}
-	c.pubKey = "cHVi"
-	_ = c.register(context.Background())
-	if body["pub_key"] != "cHVi" || fmt.Sprint(body["features"]) != "[sdisc1 sreg1]" {
+	c.auth = newSdiscAuth(testKey(t, 0x02))
+	_, _ = c.register(context.Background())
+	if body["pub_key"] != c.auth.publicKeyBase64() || fmt.Sprint(body["features"]) != "[sdisc1 sreg1]" {
 		t.Fatalf("body = %v", body)
 	}
 }

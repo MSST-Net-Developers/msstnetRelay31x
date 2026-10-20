@@ -20,6 +20,9 @@ type relayLimits struct {
 	pingRate    float64
 	pingBurst   int
 	regAuth     regAuthMode
+	// requireRegisteredSrc (self-hosted mode): forward 0x0D only from the
+	// address its src_id is registered at here.
+	requireRegisteredSrc bool
 
 	discoveryEnabled    bool
 	discMaxSessions     int
@@ -213,8 +216,12 @@ func (r *relay) secureRegister(p packet, src netip.AddrPort, now time.Time) {
 // byte, to dst_id's registered address. The payload is one WireGuard message,
 // opaque to the relay (RELAY_REQUIREMENTS_3.1.md).
 //
-// The sender is not required to be registered here: clients send via the
-// destination's relay, which may differ from their own.
+// An official relay does not require the sender to be registered here:
+// clients send via the destination's relay, which may differ from their own.
+// A self-hosted relay serves only the rooms that designated it, whose members
+// send through it only while registered with it, so it requires src_id to be
+// registered (by 0x0E, as register_auth is required) at the source address.
+// That keeps outsiders from using it as an open forwarder.
 //
 // Because the frame is forwarded unchanged, a frame that reaches another
 // relay is processed there again. A two-relay loop (spoofed registrations
@@ -224,6 +231,10 @@ func (r *relay) secureRegister(p packet, src netip.AddrPort, now time.Time) {
 func (r *relay) forwardWireGuard(p packet, src netip.AddrPort, now time.Time) {
 	if len(p.payload) < minWireGuardLen {
 		r.stats.dropMalformed.Add(1)
+		return
+	}
+	if r.lim.requireRegisteredSrc && !r.sessions.boundTo(p.srcID, src, now) {
+		r.stats.dropUnregisteredSrc.Add(1)
 		return
 	}
 	dst, ok := r.sessions.lookup(p.dstID, now)

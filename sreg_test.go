@@ -466,7 +466,7 @@ func TestCoordinatorKeyFetcher(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := coordinatorKeyFetcher(srv.URL+"/", "s3cret", srv.Client())(context.Background(), []uint64{idA, idB})
+	got, err := coordinatorKeyFetcher(srv.URL+"/", newRelayCreds(false, "s3cret"), srv.Client())(context.Background(), []uint64{idA, idB})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,7 +477,7 @@ func TestCoordinatorKeyFetcher(t *testing.T) {
 	if a, ok := got[idA]; len(got) != 1 || !ok || !bytes.Equal(a[:], pub) {
 		t.Fatalf("got %v", got)
 	}
-	_, err = coordinatorKeyFetcher(srv.URL, "wrong", srv.Client())(context.Background(), []uint64{idA})
+	_, err = coordinatorKeyFetcher(srv.URL, newRelayCreds(false, "wrong"), srv.Client())(context.Background(), []uint64{idA})
 	if err == nil || !strings.Contains(err.Error(), "relay_secret") || strings.Contains(err.Error(), "wrong") {
 		t.Fatalf("err = %v", err)
 	}

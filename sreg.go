@@ -210,7 +210,7 @@ func (c *regKeyCache) run(ctx context.Context, timeout time.Duration) {
 		var derived map[uint64]*regKey
 		if err == nil {
 			derived = c.prepare(batch, pubs)
-		} else if !errors.Is(err, context.Canceled) {
+		} else if !errors.Is(err, context.Canceled) && !errors.Is(err, errNoToken) {
 			log.Printf("registration: fetch %d device keys: %v", len(batch), err)
 		}
 		c.complete(batch, derived, err, time.Now())
@@ -319,8 +319,10 @@ func (c *regKeyCache) sweep(now time.Time) {
 //	POST {base}/relay/device-keys  {"device_ids":["device-xxxxxxxx", ...]}
 //	→ [{"device_id":"device-xxxxxxxx","pub_key":"<base64 X25519>"}, ...]
 //
-// with X-Relay-Secret. Unknown devices are omitted from the response.
-func coordinatorKeyFetcher(base, secret string, client *http.Client) deviceKeyFetcher {
+// with relay credentials (creds). Unknown devices are omitted from the
+// response; for a self-hosted relay, so are devices that are not current
+// members of a room that designated it.
+func coordinatorKeyFetcher(base string, creds *relayCreds, client *http.Client) deviceKeyFetcher {
 	base = strings.TrimRight(base, "/")
 	return func(ctx context.Context, ids []uint64) (map[uint64][32]byte, error) {
 		req := struct {
@@ -338,8 +340,9 @@ func coordinatorKeyFetcher(base, secret string, client *http.Client) deviceKeyFe
 			return nil, err
 		}
 		hreq.Header.Set("Content-Type", "application/json")
-		if secret != "" {
-			hreq.Header.Set("X-Relay-Secret", secret)
+		tok, err := creds.apply(hreq)
+		if err != nil {
+			return nil, err
 		}
 		resp, err := client.Do(hreq)
 		if err != nil {
@@ -349,7 +352,8 @@ func coordinatorKeyFetcher(base, secret string, client *http.Client) deviceKeyFe
 		if resp.StatusCode != http.StatusOK {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			if resp.StatusCode == http.StatusUnauthorized {
-				return nil, fmt.Errorf("coordinator returned %s (check control.relay_secret)", resp.Status)
+				creds.unauthorized(tok)
+				return nil, fmt.Errorf("coordinator returned %s (%s)", resp.Status, creds.unauthorizedHint())
 			}
 			return nil, fmt.Errorf("coordinator returned %s", resp.Status)
 		}

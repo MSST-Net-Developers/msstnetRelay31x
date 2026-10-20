@@ -95,7 +95,7 @@ func testControlClient(url, secret string) *controlClient {
 	cfg.Control.ServerURL = url
 	cfg.Control.RelaySecret = secret
 	cfg.Control.HeartbeatInterval = 20 * time.Millisecond
-	c := newControlClient(cfg)
+	c := newControlClient(cfg, newRelayCreds(false, secret), nil)
 	c.retryInitial = 10 * time.Millisecond
 	c.retryMax = 40 * time.Millisecond
 	return c
