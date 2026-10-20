@@ -2,8 +2,10 @@
 
 Authenticates relay register/keepalive with the device's X25519 identity key,
 so a device ID can no longer be registered by someone who does not hold its
-private key. Relay side implemented in `sreg.go`. The Coordinator endpoint
-and the client changes below are **not implemented yet**.
+private key. Relay side implemented in `sreg.go`; Coordinator side in
+msstnetCoordinator31x `356e399`, client side in msst-net-core-31x `67deacf`.
+What remains is the last rollout step (`register_auth: required`, see
+Deployment order).
 
 Same building blocks as secure discovery (SECURE_DISCOVERY.md): the relay's
 static X25519 key, HKDF-SHA256, a truncated HMAC-SHA256 tag and time-based
@@ -92,7 +94,7 @@ Keys come from the Coordinator through `POST /relay/device-keys` (below).
   An ID is tracked only when a fetch can be queued for it, so spoofed random
   IDs cannot grow state beyond these bounds or exceed the fetch rate.
 
-## Coordinator requirement (not implemented)
+## Coordinator (implemented, msstnetCoordinator31x `356e399`)
 
 ```
 POST /relay/device-keys
@@ -106,11 +108,13 @@ X-Relay-Secret: <relay_secret>
 - 401 on a wrong secret. Serve over HTTPS.
 - Pass the relay's `features` (sent on `POST /relay/register`, currently
   `["sdisc1","sreg1"]`) through in `GET /relays`.
-- Enable `device_key_proof: required` (DEVICE_KEY_PROOF.md). Until then,
-  whoever registers a device ID first at the Coordinator decides its key.
-  sreg authenticates against that key.
+- Still open: enable `device_key_proof: required` (DEVICE_KEY_PROOF.md;
+  the Coordinator default is `off`, clients send proofs since
+  msst-net-core-31x `c92c07c`). Until then, whoever registers a device ID
+  first at the Coordinator decides its key. sreg authenticates against that
+  key.
 
-## Client requirements (not implemented)
+## Client (implemented, msst-net-core-31x `67deacf`)
 
 - Use `0x0E` instead of `0x01`/`0x02` with relays whose `/relays` entry lists
   `"sreg1"` in `features`. Keep `0x01`/`0x02` for other relays.
@@ -138,12 +142,15 @@ X-Relay-Secret: <relay_secret>
 
 ## Deployment order
 
-1. Relay (this change): `register_auth: optional`. It reports
-   `features: ["sdisc1","sreg1"]`.
-2. Coordinator: `POST /relay/device-keys`, `features` in `/relays`,
-   `device_key_proof: required` once clients send proofs.
-3. Clients send `0x0E` to relays advertising `sreg1`.
-4. Relays switch to `register_auth: required`.
+1. Relay: `register_auth: optional`. It reports
+   `features: ["sdisc1","sreg1"]`. Done.
+2. Coordinator: `POST /relay/device-keys`, `features` in `/relays`. Done;
+   `device_key_proof: required` still to be switched on.
+3. Clients send `0x0E` to relays advertising `sreg1`. Done in the client;
+   takes effect as clients upgrade.
+4. Relays switch to `register_auth: required` once no clients without
+   `0x0E` remain (official relays; self-hosted relays require it already,
+   SELF_HOSTED.md).
 
 ## Test vectors
 
