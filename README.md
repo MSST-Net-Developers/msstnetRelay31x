@@ -12,7 +12,7 @@ connection link ([SELF_HOSTED.md](SELF_HOSTED.md)).
 ```bash
 go build -o msstnetRelay31x .
 ./msstnetRelay31x -config config.yaml   # creates a default config (mode 0600) if missing
-./msstnetRelay31x -config config.yaml -print-link   # print the connection link and exit
+./msstnetRelay31x -config config.yaml -print-link   # print the connection link and exit (creates the relay key if missing)
 go vet ./... && go test -race ./...
 ```
 

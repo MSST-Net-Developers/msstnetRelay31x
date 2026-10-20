@@ -8,11 +8,11 @@ import (
 	"log"
 	"maps"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -357,19 +357,64 @@ func (c *Config) validateSelfHosted(bad func(string, ...any)) {
 	}
 }
 
-// checkHostPort accepts host:port with a non-empty host and a port 1–65535.
+// cgnat is the shared address space of carrier-grade NAT (RFC 6598).
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+
+// checkHostPort accepts the public address of a self-hosted relay: host:port
+// with a port 1–65535, where host is a DNS name or a public unicast IP. It
+// applies the Coordinator's rule for self-hosted registration
+// (msstnetCoordinator31x validateRelayAddr), so a bad address fails here at
+// startup instead of in every registration attempt.
 func checkHostPort(s string) error {
 	host, port, err := net.SplitHostPort(s)
 	if err != nil {
 		return err
 	}
-	if host == "" || strings.ContainsAny(host, "/?#@ ") {
-		return errors.New("invalid host")
-	}
 	if n, err := strconv.ParseUint(port, 10, 16); err != nil || n == 0 {
 		return errors.New("invalid port")
 	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.Zone() != "" || cgnat.Contains(ip.Unmap()) {
+			return errors.New("not a public IP address; clients must be able to reach it")
+		}
+		return nil
+	}
+	if !isDomainName(host) {
+		return errors.New("invalid host")
+	}
 	return nil
+}
+
+// isDomainName reports whether s is a syntactically valid DNS host name
+// (letters, digits and inner hyphens; labels of 1–63 bytes; no trailing dot).
+func isDomainName(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	label := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			label++
+		case c == '-':
+			if label == 0 || i+1 == len(s) || s[i+1] == '.' {
+				return false
+			}
+			label++
+		case c == '.':
+			if label == 0 {
+				return false
+			}
+			label = 0
+		default:
+			return false
+		}
+		if label > 63 {
+			return false
+		}
+	}
+	return label > 0
 }
 
 func (c *Config) selfHosted() bool { return c.Relay.Mode == relayModeSelfHosted }

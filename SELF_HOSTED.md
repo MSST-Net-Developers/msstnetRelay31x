@@ -6,8 +6,10 @@ room owner designates it when creating a room by pasting its connection
 link, and the room's traffic then goes through it. Design and decisions:
 `msst-net-core-31x/docs/ROOM_RELAY_3.1.md`; server-side items RR1–RR6 of
 `ROOM_RELAY_SERVER_3.1.md` are implemented here (`selfhosted.go`,
-`control.go`). The Coordinator side (CR2–CR5) is **not implemented yet**;
-until it is, registration fails and is retried (forwarding is unaffected).
+`control.go`). The Coordinator side (CR1–CR5) is implemented in
+msstnetCoordinator31x `35ee56f` (`relay_selfhosted.go`, `room.go`); against an
+older Coordinator, registration fails and is retried (forwarding is
+unaffected).
 
 ## Configuration
 
@@ -31,8 +33,13 @@ The relay refuses to start in self-hosted mode if `register_auth` is not
 `required` (otherwise anyone could register with `0x01` and use the relay
 without the relay password), if `control.relay_secret` is set (official
 secrets must not be copied to third-party machines), if `server_url` is not
-https, or if `node.addr` is not a `host:port`. `node.id` and `node.region`
-are not used.
+https, or if `node.addr` is not a public `host:port`. `node.id` and
+`node.region` are not used.
+
+`node.addr` is the address clients send traffic to, so it must be a DNS name
+or a public unicast IP: private, loopback, link-local, unique-local and
+carrier-grade NAT (100.64.0.0/10) addresses are rejected. The Coordinator
+applies the same rule at registration (`invalid_addr`).
 
 Keep the config file mode 0600 when it holds a password; the relay warns
 otherwise. The password is never logged; only its Argon2id verifier is
@@ -40,7 +47,10 @@ sent to the Coordinator.
 
 ## Connection link
 
-Printed at startup and by `-print-link`:
+Printed at startup and by `-print-link`. `-print-link` reads the existing
+config and, like a normal start, creates the relay key
+(`discovery.auth_key_file`) if it does not exist yet; that key is the relay's
+identity, so keep it with the config.
 
 ```
 msst-relay://<node.addr>#<base64url(relay public key), unpadded>[?pw=1]
