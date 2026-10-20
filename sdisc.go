@@ -55,7 +55,8 @@ const (
 	sdiscCounterShift = 16
 )
 
-// sdiscAuth is the relay's static X25519 key.
+// sdiscAuth is the relay's static X25519 key, used by secure discovery and
+// by registration authentication (sreg.go).
 type sdiscAuth struct {
 	priv *ecdh.PrivateKey
 	pub  [32]byte
@@ -76,9 +77,26 @@ type sdiscKeys struct {
 	r2c [32]byte
 }
 
-// derive performs the X25519 exchange with a device key. It fails for
-// low-order device keys (all-zero shared secret).
+// derive returns the sdisc keys shared with a device.
 func (a *sdiscAuth) derive(id uint64, devPub [32]byte) (*sdiscKeys, error) {
+	okm, err := a.kdf(sdiscLabel, id, devPub, 64)
+	if err != nil {
+		return nil, err
+	}
+	k := &sdiscKeys{pub: devPub}
+	copy(k.c2r[:], okm[:32])
+	copy(k.r2c[:], okm[32:])
+	return k, nil
+}
+
+// kdf performs the X25519 exchange with a device key and expands it:
+//
+//	HKDF-SHA256(X25519(relay_sk, device_pk), salt=label,
+//	            info=device_id(8, BE)‖device_pk‖relay_pk, n)
+//
+// The label separates protocols (sdisc, sreg) that share the relay key. It
+// fails for low-order device keys (all-zero shared secret).
+func (a *sdiscAuth) kdf(label string, id uint64, devPub [32]byte, n int) ([]byte, error) {
 	pk, err := ecdh.X25519().NewPublicKey(devPub[:])
 	if err != nil {
 		return nil, err
@@ -91,14 +109,7 @@ func (a *sdiscAuth) derive(id uint64, devPub [32]byte) (*sdiscKeys, error) {
 	info = binary.BigEndian.AppendUint64(info, id)
 	info = append(info, devPub[:]...)
 	info = append(info, a.pub[:]...)
-	okm, err := hkdf.Key(sha256.New, shared, []byte(sdiscLabel), string(info), 64)
-	if err != nil {
-		return nil, err
-	}
-	k := &sdiscKeys{pub: devPub}
-	copy(k.c2r[:], okm[:32])
-	copy(k.r2c[:], okm[32:])
-	return k, nil
+	return hkdf.Key(sha256.New, shared, []byte(label), string(info), n)
 }
 
 // sdiscTag computes the truncated HMAC of msg into out.
@@ -224,14 +235,14 @@ func loadOrCreateRelayKey(path string) (*ecdh.PrivateKey, error) {
 		if err := f.Close(); err != nil {
 			return nil, err
 		}
-		log.Printf("discovery: created relay key %s", path)
+		log.Printf("created relay key %s", path)
 		return priv, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm()&0o077 != 0 {
-		log.Printf("discovery: warning: %s is accessible by group/others (mode %v)", path, fi.Mode().Perm())
+		log.Printf("warning: relay key %s is accessible by group/others (mode %v)", path, fi.Mode().Perm())
 	}
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data)))
 	if err != nil || len(raw) != 32 {

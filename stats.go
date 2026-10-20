@@ -18,6 +18,12 @@ type stats struct {
 	sessionsFull      atomic.Uint64 // registration rejected: table full
 	invalidRegistrant atomic.Uint64 // registration rejected: bad ID or address
 
+	// Registration authentication (sreg).
+	dropUnauthRegister atomic.Uint64 // 0x01/0x02/0x03 refused (required mode, or ID bound by 0x0E)
+	dropRegKeyUnknown  atomic.Uint64 // 0x0E: device key not cached (yet)
+	dropRegAuth        atomic.Uint64 // 0x0E: bad tag
+	dropRegReplay      atomic.Uint64 // 0x0E: counter stale or not increasing
+
 	// Forwarding. "forwarded" means handed to the kernel socket; UDP gives no
 	// delivery guarantee beyond that.
 	dataForwarded      atomic.Uint64 // WireGuard (0x0D) frames
@@ -50,10 +56,12 @@ type stats struct {
 func (s *stats) report() {
 	log.Printf("stats: sessions=%d discovery_sessions=%d rx=%d data_fwd=%d probe_fwd=%d ping_echo=%d disc_fwd=%d "+
 		"send_err=%d reg_new=%d rebind=%d reg_full=%d reg_invalid=%d "+
+		"reg_drop{unauth=%d key_unknown=%d auth=%d replay=%d} "+
 		"drop{malformed=%d version=%d type=%d retired=%d unknown_dst=%d unverified_src=%d loop=%d rate=%d dup=%d room_unknown=%d not_in_room=%d auth=%d replay=%d}",
 		s.sessions.Load(), s.discoverySessions.Load(), s.rxPackets.Load(),
 		s.dataForwarded.Load(), s.probesForwarded.Load(), s.pingsEchoed.Load(), s.discoveryForwarded.Load(),
 		s.sendErrors.Load(), s.registrations.Load(), s.rebinds.Load(), s.sessionsFull.Load(), s.invalidRegistrant.Load(),
+		s.dropUnauthRegister.Load(), s.dropRegKeyUnknown.Load(), s.dropRegAuth.Load(), s.dropRegReplay.Load(),
 		s.dropMalformed.Load(), s.dropVersion.Load(), s.dropUnknownType.Load(), s.dropRetired.Load(), s.dropUnknownDst.Load(),
 		s.dropUnverifiedSrc.Load(), s.dropLoop.Load(), s.dropRateLimited.Load(), s.dropDuplicate.Load(),
 		s.dropRoomUnknown.Load(), s.dropNotInRoom.Load(),

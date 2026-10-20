@@ -129,7 +129,7 @@ var tNow = time.UnixMilli(1_760_000_000_000)
 
 func authLimits() relayLimits {
 	lim := testLimits()
-	lim.discAuthSkew = 30 * time.Second
+	lim.authSkew = 30 * time.Second
 	return lim
 }
 
@@ -548,7 +548,7 @@ func TestConfigAuth(t *testing.T) {
 		{"off retired", func(c *Config) { c.Discovery.Auth = "off" }, false},
 		{"optional retired", func(c *Config) { c.Discovery.Auth = "optional" }, false},
 		{"no key file", func(c *Config) { c.Discovery.AuthKeyFile = "" }, false},
-		{"no key file, discovery off", func(c *Config) { c.Discovery.AuthKeyFile, c.Discovery.Enabled = "", false }, true},
+		{"no key file, discovery off", func(c *Config) { c.Discovery.AuthKeyFile, c.Discovery.Enabled = "", false }, false}, // sreg needs it too
 		{"zero skew", func(c *Config) { c.Discovery.AuthMaxClockSkew = 0 }, false},
 		{"skew vs ttl", func(c *Config) { c.Discovery.AuthMaxClockSkew = 61 * time.Second }, false},
 		{"deprecated require_sender_in_room", func(c *Config) { c.Discovery.RequireSenderInRoom = false }, true},
@@ -565,7 +565,7 @@ func TestConfigAuth(t *testing.T) {
 }
 
 func TestControlReportsPubKey(t *testing.T) {
-	var body map[string]string
+	var body map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}))
@@ -579,7 +579,7 @@ func TestControlReportsPubKey(t *testing.T) {
 	}
 	c.pubKey = "cHVi"
 	_ = c.register(context.Background())
-	if body["pub_key"] != "cHVi" {
+	if body["pub_key"] != "cHVi" || fmt.Sprint(body["features"]) != "[sdisc1 sreg1]" {
 		t.Fatalf("body = %v", body)
 	}
 }

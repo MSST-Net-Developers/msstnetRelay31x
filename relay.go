@@ -21,6 +21,7 @@ type relayLimits struct {
 	pingBurst   int
 	probeRate   float64
 	probeBurst  int
+	regAuth     regAuthMode
 
 	discoveryEnabled    bool
 	discMaxSessions     int
@@ -35,7 +36,7 @@ type relayLimits struct {
 	discDedupTTL        time.Duration
 	discDedupMax        int
 	discMaxFanout       int
-	discAuthSkew        time.Duration // accepted |client clock - relay clock|
+	authSkew            time.Duration // sdisc/sreg: accepted |client clock - relay clock|
 	maintenanceInterval time.Duration
 }
 
@@ -51,7 +52,9 @@ type relay struct {
 	stats *stats
 	logs  *logLimiter
 
-	sessions *registry // data path: device ID → main socket address
+	sessions  *registry    // data path: device ID → main socket address
+	regKeys   regKeyLookup // sreg device keys; nil: 0x0E unavailable (no Coordinator)
+	regReplay *replayGuard // sreg counters
 
 	pingLimit  *tokenBucket // relay ping echoes (reflection bound)
 	probeLimit *tokenBucket // P2P ping/pong forwarding (loop bound)
@@ -79,6 +82,7 @@ func newRelay(out datagramWriter, lim relayLimits, rooms roomPeerLookup, st *sta
 		sessions:   newRegistry(lim.maxSessions, lim.sessionTTL),
 		pingLimit:  newTokenBucket(lim.pingRate, lim.pingBurst),
 		probeLimit: newTokenBucket(lim.probeRate, lim.probeBurst),
+		regReplay:  newReplayGuard(lim.maxSessions, lim.sessionTTL, lim.authSkew),
 		rooms:      rooms,
 	}
 	if lim.discoveryEnabled {
@@ -88,7 +92,7 @@ func newRelay(out datagramWriter, lim relayLimits, rooms roomPeerLookup, st *sta
 		r.discEgress = newTokenBucket(lim.discEgressRate, lim.discEgressBurst)
 		r.discDedup = newDedupCache(lim.discDedupMax, lim.discDedupTTL)
 		r.fanout = make([]fanoutTarget, 0, lim.discMaxFanout)
-		r.discReplay = newReplayGuard(lim.discMaxSessions, lim.discSessionTTL, lim.discAuthSkew)
+		r.discReplay = newReplayGuard(lim.discMaxSessions, lim.discSessionTTL, lim.authSkew)
 		r.deliverBuf = make([]byte, 0, headerLen+sdiscCounterLen+maxDatagram+sdiscTagLen)
 	}
 	return r
@@ -121,7 +125,14 @@ func (r *relay) handle(buf []byte, src netip.AddrPort, now time.Time) {
 
 	switch p.typ {
 	case typRegister, typKeepalive, typPunch:
-		r.register(r.sessions, p.srcID, src, now, "session")
+		if r.lim.regAuth == regAuthRequired {
+			r.stats.dropUnauthRegister.Add(1)
+			return
+		}
+		r.register(r.sessions, p.srcID, src, now, "session", false)
+
+	case typSecureRegister:
+		r.secureRegister(p, src, now)
 
 	case typWireGuard:
 		r.forwardWireGuard(p, src, now)
@@ -160,12 +171,13 @@ func (r *relay) handle(buf []byte, src netip.AddrPort, now time.Time) {
 	}
 }
 
-func (r *relay) register(reg *registry, id uint64, src netip.AddrPort, now time.Time, kind string) {
+// register binds id to src. secure reports that the packet was authenticated.
+func (r *relay) register(reg *registry, id uint64, src netip.AddrPort, now time.Time, kind string, secure bool) {
 	if !validDeviceID(id) {
 		r.stats.invalidRegistrant.Add(1)
 		return
 	}
-	switch reg.register(id, src, now) {
+	switch reg.register(id, src, now, secure) {
 	case regNew:
 		r.stats.registrations.Add(1)
 		r.logs.printf(now, "%s registered: id=%08x addr=%s", kind, id, src)
@@ -177,8 +189,43 @@ func (r *relay) register(reg *registry, id uint64, src netip.AddrPort, now time.
 		r.logs.printf(now, "%s table full (%d): rejecting id=%08x", kind, reg.max, id)
 	case regInvalidAddr:
 		r.stats.invalidRegistrant.Add(1)
+	case regDenied:
+		r.stats.dropUnauthRegister.Add(1)
 	case regRefreshed:
 	}
+}
+
+// secureRegister handles an authenticated register/keepalive (0x0E). The
+// binding is only touched after the tag and counter are verified, and once
+// made it cannot be taken over by unauthenticated 0x01/0x02 while it is live.
+func (r *relay) secureRegister(p packet, src netip.AddrPort, now time.Time) {
+	if len(p.payload) != sregPayloadLen || p.dstID != 0 || !validDeviceID(p.srcID) {
+		r.stats.dropMalformed.Add(1)
+		return
+	}
+	if r.regKeys == nil {
+		r.stats.dropRegKeyUnknown.Add(1)
+		return
+	}
+	k, ok := r.regKeys.key(p.srcID, now) // a miss schedules a fetch
+	if !ok {
+		r.stats.dropRegKeyUnknown.Add(1)
+		return
+	}
+	if !sdiscVerify(&k.mac, p.raw) {
+		r.stats.dropRegAuth.Add(1)
+		return
+	}
+	switch r.regReplay.accept(p.srcID, binary.BigEndian.Uint64(p.payload), now) {
+	case replayOK:
+	case replayFull:
+		r.stats.sessionsFull.Add(1)
+		return
+	default:
+		r.stats.dropRegReplay.Add(1)
+		return
+	}
+	r.register(r.sessions, p.srcID, src, now, "session", true)
 }
 
 // forwardWireGuard sends the whole datagram, header included and byte for
@@ -307,7 +354,7 @@ func (r *relay) secureDiscovery(p packet, src netip.AddrPort, now time.Time) {
 	}
 	// Authenticated: the sender may (re)bind its discovery address, which
 	// also covers NAT rebinding and roaming.
-	r.register(r.discSessions, p.srcID, src, now, "discovery")
+	r.register(r.discSessions, p.srcID, src, now, "discovery", true)
 	if !isData {
 		return
 	}
@@ -407,6 +454,10 @@ func (r *relay) send(b []byte, dst netip.AddrPort, now time.Time) bool {
 func (r *relay) maintain(now time.Time) {
 	r.nextMaintenance = now.Add(r.lim.maintenanceInterval)
 	r.sessions.sweep(now)
+	r.regReplay.sweep(now)
+	if kc, ok := r.regKeys.(*regKeyCache); ok && kc != nil {
+		kc.sweep(now)
+	}
 	r.stats.sessions.Store(int64(r.sessions.len()))
 	if r.discSessions != nil {
 		r.discSessions.sweep(now)

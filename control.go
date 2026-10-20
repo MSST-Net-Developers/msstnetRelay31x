@@ -26,7 +26,7 @@ type controlClient struct {
 	region    string
 	addr      string
 	secret    string
-	pubKey    string // secure-discovery public key (base64); empty when discovery is disabled
+	pubKey    string // relay public key (base64) for sdisc and sreg
 	interval  time.Duration
 	http      *http.Client
 
@@ -83,16 +83,23 @@ func (c *controlClient) post(ctx context.Context, path string, body any) error {
 	}
 }
 
+// relayFeatures are the optional protocols this relay supports, reported on
+// registration so that clients can pick them per relay (via GET /relays):
+// "sdisc1" = SECURE_DISCOVERY.md, "sreg1" = REGISTRATION_AUTH.md. 0x0E has no
+// reply, so clients cannot detect support any other way.
+var relayFeatures = []string{"sdisc1", "sreg1"}
+
 func (c *controlClient) register(ctx context.Context) error {
-	body := map[string]string{
+	body := map[string]any{
 		"id":     c.id,
 		"region": c.region,
 		"addr":   c.addr,
 	}
-	// Coordinator 3.1.x ignores unknown fields; clients need this key (via
-	// GET /relays) to use secure discovery with this relay.
+	// Clients need this key (via GET /relays) for secure discovery and
+	// authenticated registration with this relay.
 	if c.pubKey != "" {
 		body["pub_key"] = c.pubKey
+		body["features"] = relayFeatures
 	}
 	return c.post(ctx, "/relay/register", body)
 }

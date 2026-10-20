@@ -38,8 +38,20 @@ func (f *fakeCoordinator) handler() http.Handler {
 		if !auth(w, r) {
 			return
 		}
+		// Like the Coordinator's struct decoding, unknown fields are ignored.
 		var req map[string]string
-		if json.NewDecoder(r.Body).Decode(&req) != nil || req["id"] == "" || req["region"] == "" || req["addr"] == "" {
+		var raw map[string]any
+		if json.NewDecoder(r.Body).Decode(&raw) != nil {
+			http.Error(w, "bad", http.StatusBadRequest)
+			return
+		}
+		req = map[string]string{}
+		for k, v := range raw {
+			if s, ok := v.(string); ok {
+				req[k] = s
+			}
+		}
+		if req["id"] == "" || req["region"] == "" || req["addr"] == "" {
 			http.Error(w, "bad", http.StatusBadRequest)
 			return
 		}

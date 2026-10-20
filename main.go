@@ -53,26 +53,28 @@ func main() {
 	var wg sync.WaitGroup
 	st := &stats{}
 
-	var auth *sdiscAuth
-	if cfg.Discovery.Enabled {
-		priv, err := loadOrCreateRelayKey(cfg.Discovery.AuthKeyFile)
-		if err != nil {
-			log.Fatalf("discovery auth key: %v", err)
-		}
-		auth = newSdiscAuth(priv)
-		log.Printf("discovery: secure discovery (required), relay public key %s", auth.publicKeyBase64())
-		if !cfg.Discovery.RequireSenderInRoom {
-			log.Printf("discovery: require_sender_in_room is deprecated and ignored; senders must always be room members")
-		}
+	// The relay key serves secure discovery and registration auth.
+	priv, err := loadOrCreateRelayKey(cfg.Discovery.AuthKeyFile)
+	if err != nil {
+		log.Fatalf("relay key: %v", err)
+	}
+	auth := newSdiscAuth(priv)
+	log.Printf("relay public key %s; register_auth=%s", auth.publicKeyBase64(), cfg.Relay.RegisterAuth)
+	if cfg.Discovery.Enabled && !cfg.Discovery.RequireSenderInRoom {
+		log.Printf("discovery: require_sender_in_room is deprecated and ignored; senders must always be room members")
 	}
 
 	var rooms roomPeerLookup
+	var regKeys regKeyLookup
 	if cfg.Control.ServerURL != "" {
 		cc := newControlClient(cfg)
-		if auth != nil {
-			cc.pubKey = auth.publicKeyBase64()
-		}
+		cc.pubKey = auth.publicKeyBase64()
 		wg.Go(func() { cc.run(ctx) })
+
+		kc := newRegKeyCache(coordinatorKeyFetcher(cfg.Control.ServerURL, cfg.Control.RelaySecret, &http.Client{Timeout: 5 * time.Second}),
+			auth, cfg.Relay.DeviceKeyMaxEntries, cfg.Relay.DeviceKeyTTL, cfg.Relay.DeviceKeyStaleTTL)
+		wg.Go(func() { kc.run(ctx, 5*time.Second) })
+		regKeys = kc
 
 		if cfg.Discovery.Enabled {
 			httpc := &http.Client{Timeout: 3 * time.Second}
@@ -84,7 +86,7 @@ func main() {
 			rooms = rc
 		}
 	} else {
-		log.Printf("control.server_url is empty: not registering with a Coordinator; discovery forwarding disabled")
+		log.Printf("control.server_url is empty: not registering with a Coordinator; discovery forwarding and 0x0E registration disabled")
 	}
 	if cfg.Log.StatsInterval > 0 {
 		wg.Go(func() { st.runReporter(ctx, cfg.Log.StatsInterval) })
@@ -97,6 +99,7 @@ func main() {
 	})
 
 	r := newRelay(conn, cfg.limits(), rooms, st)
+	r.regKeys = regKeys
 	serve(conn, r)
 
 	stop()

@@ -18,7 +18,8 @@ processing (preserves per-flow ordering). Header: `"MSST"|ver=1|type|flags|src_i
 
 | Type | Relay action | Checks |
 |------|--------------|--------|
-| 0x01 register, 0x02 keepalive, 0x03 punch | bind `src_id` → source address | ID in `1..0xFFFFFFFF`; address not unspecified/multicast/broadcast; table cap |
+| 0x01 register, 0x02 keepalive, 0x03 punch | bind `src_id` → source address | ID in `1..0xFFFFFFFF`; address not unspecified/multicast/broadcast; table cap. `register_auth: optional`: refused for an ID with a live 0x0E binding; `required`: dropped |
+| 0x0E sreg (authenticated register/keepalive) | bind `src_id` → source address, marked authenticated | device key from the Coordinator (cached; miss → drop + fetch); tag; counter. See [REGISTRATION_AUTH.md](REGISTRATION_AUTH.md) |
 | 0x05 ping | echo datagram to sender | ≤ 64 bytes; global rate limit |
 | 0x06 p2p ping | forward datagram unchanged to `dst_id` | `src_id` must be bound to the source address; dst registered; dst ≠ src; payload ≥ 12; global rate limit |
 | 0x07 p2p pong | forward datagram unchanged to `dst_id` | dst registered; dst ≠ src; payload ≥ 12; global rate limit |
@@ -46,33 +47,40 @@ global egress budget. No bare IPv4 is ever sent.
   clients accept only relay-authenticated 0x0C.
 - **Peer data** is WireGuard (0x0D): confidentiality and integrity are end to
   end between clients, and the relay forwards it without inspecting it.
-- **Registration (0x01/0x02) is still unauthenticated.** `src_id` is a
-  claim; anyone who can send UDP to the relay can register any device ID and
-  divert that device's 0x0D/0x06/0x07 traffic until its next keepalive (last
-  writer wins, needed for NAT rebinding). With WireGuard this is a denial of
-  service, not a data leak. Closing it needs an sdisc-style tag on
-  register/keepalive and a matching client change.
+- **Registration:** devices using sreg (`0x0E`, REGISTRATION_AUTH.md) hold
+  bindings that only the key holder can move. Unauthenticated `0x01`/`0x02`
+  remain accepted in `register_auth: optional` (the default, until clients
+  send 0x0E). For devices still using them, `src_id` is a claim: anyone who
+  can send UDP to the relay can divert their 0x0D/0x06/0x07 traffic until
+  their next keepalive (denial of service; WireGuard keeps the content
+  confidential). `register_auth: required` closes this. Even with sreg, an
+  on-path attacker who relays a captured `0x0E` first can move a binding
+  until the next keepalive.
 - **Relay forwarding loops.** 0x0D/0x06/0x07 are forwarded unchanged, so a
   frame sent to a client address that is in fact another relay is processed
   again there. Two relays pointed at each other are cut by the dst ≠ src
   check, and the relay's own address by the same check. Cycles through three
   or more relays need spoofed registrations from the relays' own addresses
   (IP spoofing). They are bounded for probes by the global probe budget and
-  for 0x0D only by binding expiry (`session_ttl`). Authenticated
-  registration would remove this too.
+  for 0x0D only by binding expiry (`session_ttl`). With
+  `register_auth: required` such registrations need the device's private
+  key.
 - Data senders are not required to be registered: clients deliberately send
   via the *destination's* relay.
 
 ## Coordinator interface
 
-- `POST /relay/register {id,region,addr,pub_key}` (`pub_key`: the sdisc key;
-  omitted only when discovery is disabled), `POST /relay/heartbeat {id}` every
+- `POST /relay/register {id,region,addr,pub_key,features}` (`pub_key`: the
+  relay key for sdisc and sreg; `features`: `["sdisc1","sreg1"]`), `POST /relay/heartbeat {id}` every
   `heartbeat_interval` (10 s; Coordinator expires relays after 30 s), with
   `X-Relay-Secret: <control.relay_secret>` when set. 401 → secret mismatch;
   404 on heartbeat → re-register. Backoff 5 s → 5 min with jitter.
 - `GET /room/{id}/discovery-peers` with `X-Relay-Secret`: `[{device_id, pub_key}]`.
-- Forwarding never depends on the Coordinator being reachable; discovery
-  needs the peer list.
+- `POST /relay/device-keys {device_ids:[…≤256]}` with `X-Relay-Secret`:
+  `[{device_id, pub_key}]`, for 0x0E (not yet in the Coordinator).
+- Forwarding never depends on the Coordinator being reachable. Discovery
+  needs the peer list, and a device's *first* 0x0E needs its key (cached keys
+  are served for `device_key_stale_ttl` during outages).
 
 ## Configuration and limits
 
@@ -89,6 +97,9 @@ but ignored, because senders must always be room members.
 | `relay.session_ttl` | 120s | client keepalive is 5–30 s (default 25 s) |
 | `relay.ping_rate/burst` | 2000/4000 | bounds reflection to spoofed sources |
 | `relay.probe_rate/burst` | 5000/10000 | bounds P2P probe forwarding and relay↔relay loops |
+| `relay.register_auth` | optional | `optional` / `required` (unauthenticated 0x01/0x02) |
+| `relay.device_key_ttl` / `_stale_ttl` | 10m / 1h | sreg key refresh / serve during Coordinator outage |
+| `relay.device_key_max_entries` | 65536 | cached device keys |
 | `discovery.session_ttl` | 120s | client re-registers every 25 s |
 | `discovery.sender_rate/burst` | 10/10 | 3.0.x per-device limit |
 | `discovery.ingress_rate/burst` | 2000/4000 | global, applied to authenticated data packets |
@@ -96,12 +107,13 @@ but ignored, because senders must always be room members.
 | `discovery.max_fanout` | 256 | recipients per packet |
 | `discovery.room_cache_*` | 5s / 30s / 4096 | refresh / serve-stale / rooms |
 | `discovery.auth` | required | only `required` (or empty) |
-| `discovery.auth_key_file` | relay_discovery.key | relay X25519 key, created 0600 |
-| `discovery.auth_max_clock_skew` | 30s | counter freshness; `session_ttl` must be ≥ 2× |
+| `discovery.auth_key_file` | relay_discovery.key | relay X25519 key (sdisc and sreg), created 0600 |
+| `discovery.auth_max_clock_skew` | 30s | sdisc/sreg counter freshness; both session TTLs must be ≥ 2× |
 | `log.stats_interval` | 60s | counters line; 0 disables |
 
-Coordinator lookups are additionally limited to 10/s (burst 20) and 2
-workers so the relay stays within the Coordinator's per-IP rate limit.
+Coordinator lookups are additionally limited (room lists 10/s, burst 20, 2
+workers; device keys ≤ 10 batched requests/s, 1 worker) so the relay stays
+within the Coordinator's per-IP rate limit.
 
 Observability is a periodic stats log line; there is no admin/HTTP
 interface. Diagnostic logs that remote parties can trigger are rate-limited.

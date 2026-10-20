@@ -55,6 +55,19 @@ type RelayConfig struct {
 	// Clients send about one relay-path probe per peer per probe interval.
 	ProbeRate  float64 `yaml:"probe_rate"`
 	ProbeBurst int     `yaml:"probe_burst"`
+
+	// RegisterAuth controls unauthenticated register/keepalive
+	// (0x01/0x02/0x03; REGISTRATION_AUTH.md): "optional" accepts them unless
+	// the device ID has a live binding made by authenticated 0x0E; "required"
+	// drops them (only after all clients send 0x0E).
+	RegisterAuth string `yaml:"register_auth"`
+	// Device public keys for 0x0E come from the Coordinator. A key is
+	// refreshed after DeviceKeyTTL and served for DeviceKeyStaleTTL after the
+	// last successful fetch (Coordinator outages); at most
+	// DeviceKeyMaxEntries are cached.
+	DeviceKeyTTL        time.Duration `yaml:"device_key_ttl"`
+	DeviceKeyStaleTTL   time.Duration `yaml:"device_key_stale_ttl"`
+	DeviceKeyMaxEntries int           `yaml:"device_key_max_entries"`
 }
 
 type DiscoveryConfig struct {
@@ -91,13 +104,14 @@ type DiscoveryConfig struct {
 	// unauthenticated 0x08/0x09 are retired. Empty means "required".
 	Auth string `yaml:"auth"`
 	// AuthKeyFile holds the relay's X25519 private key (base64); created
-	// with mode 0600 if missing. Its public key is reported to the
-	// Coordinator as pub_key; clients need it (via GET /relays) to use this
-	// relay for discovery.
+	// with mode 0600 if missing. It is used for secure discovery and for
+	// registration authentication (relay.register_auth), whether or not
+	// discovery is enabled. Its public key is reported to the Coordinator as
+	// pub_key; clients get it via GET /relays.
 	AuthKeyFile string `yaml:"auth_key_file"`
-	// AuthMaxClockSkew bounds |client clock - relay clock| for packet
-	// counters, and thereby how long a packet can be replayed after a relay
-	// restart.
+	// AuthMaxClockSkew bounds |client clock - relay clock| for sdisc and
+	// sreg packet counters, and thereby how long a packet can be replayed
+	// after a relay restart.
 	AuthMaxClockSkew time.Duration `yaml:"auth_max_clock_skew"`
 }
 
@@ -120,15 +134,19 @@ type LogConfig struct {
 func defaultConfig() *Config {
 	return &Config{
 		Relay: RelayConfig{
-			Bind:              "[::]:21031",
-			SocketReadBuffer:  4 << 20,
-			SocketWriteBuffer: 4 << 20,
-			MaxSessions:       65536,
-			SessionTTL:        120 * time.Second,
-			PingRate:          2000,
-			PingBurst:         4000,
-			ProbeRate:         5000,
-			ProbeBurst:        10000,
+			Bind:                "[::]:21031",
+			SocketReadBuffer:    4 << 20,
+			SocketWriteBuffer:   4 << 20,
+			MaxSessions:         65536,
+			SessionTTL:          120 * time.Second,
+			PingRate:            2000,
+			PingBurst:           4000,
+			ProbeRate:           5000,
+			ProbeBurst:          10000,
+			RegisterAuth:        "optional",
+			DeviceKeyTTL:        10 * time.Minute,
+			DeviceKeyStaleTTL:   time.Hour,
+			DeviceKeyMaxEntries: 65536,
 		},
 		Discovery: DiscoveryConfig{
 			Enabled:             true,
@@ -226,6 +244,9 @@ func (c *Config) validate() error {
 		"discovery.dedup_max_entries":      float64(c.Discovery.DedupMaxEntries),
 		"discovery.room_cache_max_entries": float64(c.Discovery.RoomCacheMaxEntries),
 		"discovery.max_fanout":             float64(c.Discovery.MaxFanout),
+		"relay.device_key_ttl":             c.Relay.DeviceKeyTTL.Seconds(),
+		"relay.device_key_stale_ttl":       c.Relay.DeviceKeyStaleTTL.Seconds(),
+		"relay.device_key_max_entries":     float64(c.Relay.DeviceKeyMaxEntries),
 		"relay.session_ttl":                c.Relay.SessionTTL.Seconds(),
 		"discovery.session_ttl":            c.Discovery.SessionTTL.Seconds(),
 		"discovery.dedup_ttl":              c.Discovery.DedupTTL.Seconds(),
@@ -254,17 +275,26 @@ func (c *Config) validate() error {
 	if a := c.Discovery.Auth; a != "" && a != "required" {
 		bad("discovery.auth %q: only \"required\" is supported (unauthenticated discovery is retired in 3.1.x)", a)
 	}
-	if c.Discovery.Enabled {
-		if c.Discovery.AuthKeyFile == "" {
-			bad("discovery.auth_key_file is required when discovery is enabled")
-		}
-		if c.Discovery.AuthMaxClockSkew <= 0 {
-			bad("discovery.auth_max_clock_skew must be > 0")
-		}
-		// The replay window must outlive any packet that is still fresh.
-		if c.Discovery.SessionTTL < 2*c.Discovery.AuthMaxClockSkew {
-			bad("discovery.session_ttl must be >= 2 * discovery.auth_max_clock_skew")
-		}
+	if c.Discovery.AuthKeyFile == "" {
+		bad("discovery.auth_key_file is required (relay key for discovery and registration auth)")
+	}
+	if c.Discovery.AuthMaxClockSkew <= 0 {
+		bad("discovery.auth_max_clock_skew must be > 0")
+	}
+	// Replay windows must outlive any packet that is still fresh.
+	if c.Discovery.Enabled && c.Discovery.SessionTTL < 2*c.Discovery.AuthMaxClockSkew {
+		bad("discovery.session_ttl must be >= 2 * discovery.auth_max_clock_skew")
+	}
+	if c.Relay.SessionTTL < 2*c.Discovery.AuthMaxClockSkew {
+		bad("relay.session_ttl must be >= 2 * discovery.auth_max_clock_skew")
+	}
+	if mode, err := parseRegAuthMode(c.Relay.RegisterAuth); err != nil {
+		bad("relay.register_auth: %v", err)
+	} else if mode == regAuthRequired && c.Control.ServerURL == "" {
+		bad("relay.register_auth: required needs control.server_url (device keys come from the Coordinator)")
+	}
+	if c.Relay.DeviceKeyStaleTTL < c.Relay.DeviceKeyTTL {
+		bad("relay.device_key_stale_ttl must be >= relay.device_key_ttl")
 	}
 	if c.Log.StatsInterval < 0 {
 		bad("log.stats_interval must be >= 0")
@@ -284,6 +314,12 @@ func (c *Config) validate() error {
 	return errors.Join(errs...)
 }
 
+// regAuthMode returns the parsed relay.register_auth. Call after validate.
+func (c *Config) regAuthMode() regAuthMode {
+	m, _ := parseRegAuthMode(c.Relay.RegisterAuth)
+	return m
+}
+
 func (c *Config) limits() relayLimits {
 	return relayLimits{
 		maxSessions:         c.Relay.MaxSessions,
@@ -292,6 +328,7 @@ func (c *Config) limits() relayLimits {
 		pingBurst:           c.Relay.PingBurst,
 		probeRate:           c.Relay.ProbeRate,
 		probeBurst:          c.Relay.ProbeBurst,
+		regAuth:             c.regAuthMode(),
 		discoveryEnabled:    c.Discovery.Enabled,
 		discMaxSessions:     c.Discovery.MaxSessions,
 		discSessionTTL:      c.Discovery.SessionTTL,
@@ -305,7 +342,7 @@ func (c *Config) limits() relayLimits {
 		discDedupTTL:        c.Discovery.DedupTTL,
 		discDedupMax:        c.Discovery.DedupMaxEntries,
 		discMaxFanout:       c.Discovery.MaxFanout,
-		discAuthSkew:        c.Discovery.AuthMaxClockSkew,
+		authSkew:            c.Discovery.AuthMaxClockSkew,
 		maintenanceInterval: 5 * time.Second,
 	}
 }
