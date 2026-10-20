@@ -19,7 +19,7 @@ type stats struct {
 	invalidRegistrant atomic.Uint64 // registration rejected: bad ID or address
 
 	// Registration authentication (sreg).
-	dropUnauthRegister atomic.Uint64 // 0x01/0x02/0x03 refused (required mode, or ID bound by 0x0E)
+	dropUnauthRegister atomic.Uint64 // 0x01/0x02 refused (required mode, or ID bound by 0x0E)
 	dropRegKeyUnknown  atomic.Uint64 // 0x0E: device key not cached (yet)
 	dropRegAuth        atomic.Uint64 // 0x0E: bad tag
 	dropRegReplay      atomic.Uint64 // 0x0E: counter stale or not increasing
@@ -27,7 +27,6 @@ type stats struct {
 	// Forwarding. "forwarded" means handed to the kernel socket; UDP gives no
 	// delivery guarantee beyond that.
 	dataForwarded      atomic.Uint64 // WireGuard (0x0D) frames
-	probesForwarded    atomic.Uint64 // P2P ping/pong
 	pingsEchoed        atomic.Uint64
 	discoveryForwarded atomic.Uint64 // per-recipient datagrams
 	sendErrors         atomic.Uint64
@@ -36,7 +35,7 @@ type stats struct {
 	dropMalformed     atomic.Uint64 // framing / field validation
 	dropVersion       atomic.Uint64
 	dropUnknownType   atomic.Uint64
-	dropRetired       atomic.Uint64 // 3.0.x types 0x04/0x08/0x09
+	dropRetired       atomic.Uint64 // retired types 0x03/0x04/0x06/0x07/0x08/0x09
 	dropUnknownDst    atomic.Uint64 // destination not registered or expired
 	dropUnverifiedSrc atomic.Uint64 // P2P ping whose src_id is not bound to its source address
 	dropLoop          atomic.Uint64 // destination equals source
@@ -54,12 +53,12 @@ type stats struct {
 }
 
 func (s *stats) report() {
-	log.Printf("stats: sessions=%d discovery_sessions=%d rx=%d data_fwd=%d probe_fwd=%d ping_echo=%d disc_fwd=%d "+
+	log.Printf("stats: sessions=%d discovery_sessions=%d rx=%d data_fwd=%d ping_echo=%d disc_fwd=%d "+
 		"send_err=%d reg_new=%d rebind=%d reg_full=%d reg_invalid=%d "+
 		"reg_drop{unauth=%d key_unknown=%d auth=%d replay=%d} "+
 		"drop{malformed=%d version=%d type=%d retired=%d unknown_dst=%d unverified_src=%d loop=%d rate=%d dup=%d room_unknown=%d not_in_room=%d auth=%d replay=%d}",
 		s.sessions.Load(), s.discoverySessions.Load(), s.rxPackets.Load(),
-		s.dataForwarded.Load(), s.probesForwarded.Load(), s.pingsEchoed.Load(), s.discoveryForwarded.Load(),
+		s.dataForwarded.Load(), s.pingsEchoed.Load(), s.discoveryForwarded.Load(),
 		s.sendErrors.Load(), s.registrations.Load(), s.rebinds.Load(), s.sessionsFull.Load(), s.invalidRegistrant.Load(),
 		s.dropUnauthRegister.Load(), s.dropRegKeyUnknown.Load(), s.dropRegAuth.Load(), s.dropRegReplay.Load(),
 		s.dropMalformed.Load(), s.dropVersion.Load(), s.dropUnknownType.Load(), s.dropRetired.Load(), s.dropUnknownDst.Load(),

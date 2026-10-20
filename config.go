@@ -51,13 +51,14 @@ type RelayConfig struct {
 	// Relay ping (0x05) echoes per second, across all senders.
 	PingRate  float64 `yaml:"ping_rate"`
 	PingBurst int     `yaml:"ping_burst"`
-	// P2P ping/pong (0x06/0x07) forwards per second, across all senders.
-	// Clients send about one relay-path probe per peer per probe interval.
-	ProbeRate  float64 `yaml:"probe_rate"`
-	ProbeBurst int     `yaml:"probe_burst"`
+	// ProbeRate and ProbeBurst are deprecated and ignored: P2P ping/pong
+	// (0x06/0x07) is no longer forwarded. Kept so that existing config files
+	// still load; omitted from newly written ones.
+	ProbeRate  float64 `yaml:"probe_rate,omitempty"`
+	ProbeBurst int     `yaml:"probe_burst,omitempty"`
 
 	// RegisterAuth controls unauthenticated register/keepalive
-	// (0x01/0x02/0x03; REGISTRATION_AUTH.md): "optional" accepts them unless
+	// (0x01/0x02; REGISTRATION_AUTH.md): "optional" accepts them unless
 	// the device ID has a live binding made by authenticated 0x0E; "required"
 	// drops them (only after all clients send 0x0E).
 	RegisterAuth string `yaml:"register_auth"`
@@ -141,8 +142,6 @@ func defaultConfig() *Config {
 			SessionTTL:          120 * time.Second,
 			PingRate:            2000,
 			PingBurst:           4000,
-			ProbeRate:           5000,
-			ProbeBurst:          10000,
 			RegisterAuth:        "optional",
 			DeviceKeyTTL:        10 * time.Minute,
 			DeviceKeyStaleTTL:   time.Hour,
@@ -231,8 +230,6 @@ func (c *Config) validate() error {
 		"relay.max_sessions":               float64(c.Relay.MaxSessions),
 		"relay.ping_rate":                  c.Relay.PingRate,
 		"relay.ping_burst":                 float64(c.Relay.PingBurst),
-		"relay.probe_rate":                 c.Relay.ProbeRate,
-		"relay.probe_burst":                float64(c.Relay.ProbeBurst),
 		"discovery.max_sessions":           float64(c.Discovery.MaxSessions),
 		"discovery.sender_rate":            c.Discovery.SenderRate,
 		"discovery.sender_burst":           float64(c.Discovery.SenderBurst),
@@ -326,8 +323,6 @@ func (c *Config) limits() relayLimits {
 		sessionTTL:          c.Relay.SessionTTL,
 		pingRate:            c.Relay.PingRate,
 		pingBurst:           c.Relay.PingBurst,
-		probeRate:           c.Relay.ProbeRate,
-		probeBurst:          c.Relay.ProbeBurst,
 		regAuth:             c.regAuthMode(),
 		discoveryEnabled:    c.Discovery.Enabled,
 		discMaxSessions:     c.Discovery.MaxSessions,

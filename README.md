@@ -18,14 +18,12 @@ processing (preserves per-flow ordering). Header: `"MSST"|ver=1|type|flags|src_i
 
 | Type | Relay action | Checks |
 |------|--------------|--------|
-| 0x01 register, 0x02 keepalive, 0x03 punch | bind `src_id` → source address | ID in `1..0xFFFFFFFF`; address not unspecified/multicast/broadcast; table cap. `register_auth: optional`: refused for an ID with a live 0x0E binding; `required`: dropped |
+| 0x01 register, 0x02 keepalive | bind `src_id` → source address | ID in `1..0xFFFFFFFF`; address not unspecified/multicast/broadcast; table cap. `register_auth: optional`: refused for an ID with a live 0x0E binding; `required`: dropped |
 | 0x0E sreg (authenticated register/keepalive) | bind `src_id` → source address, marked authenticated | device key from the Coordinator (cached; miss → drop + fetch); tag; counter. See [REGISTRATION_AUTH.md](REGISTRATION_AUTH.md) |
 | 0x05 ping | echo datagram to sender | ≤ 64 bytes; global rate limit |
-| 0x06 p2p ping | forward datagram unchanged to `dst_id` | `src_id` must be bound to the source address; dst registered; dst ≠ src; payload ≥ 12; global rate limit |
-| 0x07 p2p pong | forward datagram unchanged to `dst_id` | dst registered; dst ≠ src; payload ≥ 12; global rate limit |
 | 0x0D WireGuard | forward **whole datagram unchanged** to `dst_id` | dst registered and not expired; payload ≥ 32 (smallest WireGuard message); dst ≠ src. Sender need not be registered here |
 | 0x0A / 0x0B sdisc register / data | authenticate, bind discovery address / fan out as 0x0C | see below and [SECURE_DISCOVERY.md](SECURE_DISCOVERY.md) |
-| 0x04, 0x08, 0x09 (retired) | drop | counted as `drop{retired}` |
+| 0x03, 0x04, 0x06, 0x07, 0x08, 0x09 (retired) | drop | counted as `drop{retired}`. 0x06/0x07 are client-to-client only; the relay-path RTT is measured inside the tunnel (0x0D) |
 
 Version ≠ 1, bad magic, truncated and unknown types are dropped and counted.
 Datagrams up to 65 507 bytes are accepted.
@@ -51,18 +49,17 @@ global egress budget. No bare IPv4 is ever sent.
   bindings that only the key holder can move. Unauthenticated `0x01`/`0x02`
   remain accepted in `register_auth: optional` (the default, until clients
   send 0x0E). For devices still using them, `src_id` is a claim: anyone who
-  can send UDP to the relay can divert their 0x0D/0x06/0x07 traffic until
+  can send UDP to the relay can divert their 0x0D traffic until
   their next keepalive (denial of service; WireGuard keeps the content
   confidential). `register_auth: required` closes this. Even with sreg, an
   on-path attacker who relays a captured `0x0E` first can move a binding
   until the next keepalive.
-- **Relay forwarding loops.** 0x0D/0x06/0x07 are forwarded unchanged, so a
+- **Relay forwarding loops.** 0x0D is forwarded unchanged, so a
   frame sent to a client address that is in fact another relay is processed
   again there. Two relays pointed at each other are cut by the dst ≠ src
   check, and the relay's own address by the same check. Cycles through three
   or more relays need spoofed registrations from the relays' own addresses
-  (IP spoofing). They are bounded for probes by the global probe budget and
-  for 0x0D only by binding expiry (`session_ttl`). With
+  (IP spoofing) and last until the bindings expire (`session_ttl`). With
   `register_auth: required` such registrations need the device's private
   key.
 - Data senders are not required to be registered: clients deliberately send
@@ -89,14 +86,14 @@ are rejected. A 3.0.x `config.yaml` still loads; add
 `control.relay_secret` if the Coordinator has `relay_secret` set. An
 earlier 3.1.x config with `discovery.auth: off` or `optional` is rejected:
 those modes no longer exist. `discovery.require_sender_in_room` is accepted
-but ignored, because senders must always be room members.
+but ignored, because senders must always be room members; so are
+`relay.probe_rate`/`probe_burst` (0x06/0x07 are no longer forwarded).
 
 | Key | Default | Rationale |
 |-----|---------|-----------|
 | `relay.max_sessions` | 65536 | bounded state |
 | `relay.session_ttl` | 120s | client keepalive is 5–30 s (default 25 s) |
 | `relay.ping_rate/burst` | 2000/4000 | bounds reflection to spoofed sources |
-| `relay.probe_rate/burst` | 5000/10000 | bounds P2P probe forwarding and relay↔relay loops |
 | `relay.register_auth` | optional | `optional` / `required` (unauthenticated 0x01/0x02) |
 | `relay.device_key_ttl` / `_stale_ttl` | 10m / 1h | sreg key refresh / serve during Coordinator outage |
 | `relay.device_key_max_entries` | 65536 | cached device keys |

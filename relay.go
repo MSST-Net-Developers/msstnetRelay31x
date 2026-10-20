@@ -19,8 +19,6 @@ type relayLimits struct {
 	sessionTTL  time.Duration
 	pingRate    float64
 	pingBurst   int
-	probeRate   float64
-	probeBurst  int
 	regAuth     regAuthMode
 
 	discoveryEnabled    bool
@@ -56,8 +54,7 @@ type relay struct {
 	regKeys   regKeyLookup // sreg device keys; nil: 0x0E unavailable (no Coordinator)
 	regReplay *replayGuard // sreg counters
 
-	pingLimit  *tokenBucket // relay ping echoes (reflection bound)
-	probeLimit *tokenBucket // P2P ping/pong forwarding (loop bound)
+	pingLimit *tokenBucket // relay ping echoes (reflection bound)
 
 	discSessions *registry // device ID → discovery socket address (sdisc-authenticated)
 	discSender   *keyedLimiter
@@ -75,15 +72,14 @@ type relay struct {
 
 func newRelay(out datagramWriter, lim relayLimits, rooms roomPeerLookup, st *stats) *relay {
 	r := &relay{
-		out:        out,
-		lim:        lim,
-		stats:      st,
-		logs:       newLogLimiter(10, 50),
-		sessions:   newRegistry(lim.maxSessions, lim.sessionTTL),
-		pingLimit:  newTokenBucket(lim.pingRate, lim.pingBurst),
-		probeLimit: newTokenBucket(lim.probeRate, lim.probeBurst),
-		regReplay:  newReplayGuard(lim.maxSessions, lim.sessionTTL, lim.authSkew),
-		rooms:      rooms,
+		out:       out,
+		lim:       lim,
+		stats:     st,
+		logs:      newLogLimiter(10, 50),
+		sessions:  newRegistry(lim.maxSessions, lim.sessionTTL),
+		pingLimit: newTokenBucket(lim.pingRate, lim.pingBurst),
+		regReplay: newReplayGuard(lim.maxSessions, lim.sessionTTL, lim.authSkew),
+		rooms:     rooms,
 	}
 	if lim.discoveryEnabled {
 		r.discSessions = newRegistry(lim.discMaxSessions, lim.discSessionTTL)
@@ -124,7 +120,7 @@ func (r *relay) handle(buf []byte, src netip.AddrPort, now time.Time) {
 	}
 
 	switch p.typ {
-	case typRegister, typKeepalive, typPunch:
+	case typRegister, typKeepalive:
 		if r.lim.regAuth == regAuthRequired {
 			r.stats.dropUnauthRegister.Add(1)
 			return
@@ -140,22 +136,6 @@ func (r *relay) handle(buf []byte, src netip.AddrPort, now time.Time) {
 	case typPing:
 		r.echoPing(p, src, now)
 
-	case typP2PPing:
-		// Relay-path RTT probe: the client sends it to its own relay, so the
-		// sender must be registered here from this exact address. This keeps
-		// the relay from bouncing probes for third parties.
-		if !r.sessions.boundTo(p.srcID, src, now) {
-			r.stats.dropUnverifiedSrc.Add(1)
-			return
-		}
-		r.forwardProbe(p, src, now)
-
-	case typP2PPong:
-		// The pong comes from the peer's main socket, which need not be
-		// registered at this relay; it is delivered only to a registered
-		// destination.
-		r.forwardProbe(p, src, now)
-
 	case typSecureDiscoveryRegister, typSecureDiscoveryData:
 		if r.discSessions == nil {
 			r.stats.dropUnknownType.Add(1)
@@ -163,7 +143,8 @@ func (r *relay) handle(buf []byte, src netip.AddrPort, now time.Time) {
 		}
 		r.secureDiscovery(p, src, now)
 
-	case typRetiredData, typRetiredDiscoveryRegister, typRetiredDiscoveryData:
+	case typRetiredPunch, typRetiredData, typRetiredP2PPing, typRetiredP2PPong,
+		typRetiredDiscoveryRegister, typRetiredDiscoveryData:
 		r.stats.dropRetired.Add(1)
 
 	default:
@@ -271,33 +252,6 @@ func (r *relay) echoPing(p packet, src netip.AddrPort, now time.Time) {
 	}
 	if r.send(p.raw, src, now) {
 		r.stats.pingsEchoed.Add(1)
-	}
-}
-
-// forwardProbe forwards a P2P ping/pong unchanged to the registered
-// destination.
-func (r *relay) forwardProbe(p packet, src netip.AddrPort, now time.Time) {
-	if len(p.payload) < pingPayloadLen {
-		r.stats.dropMalformed.Add(1)
-		return
-	}
-	dst, ok := r.sessions.lookup(p.dstID, now)
-	if !ok {
-		r.stats.dropUnknownDst.Add(1)
-		return
-	}
-	if dst == src {
-		r.stats.dropLoop.Add(1)
-		return
-	}
-	// The global budget also terminates forwarding loops between relays
-	// that hold spoofed registrations pointing at each other.
-	if !r.probeLimit.allow(now) {
-		r.stats.dropRateLimited.Add(1)
-		return
-	}
-	if r.send(p.raw, dst, now) {
-		r.stats.probesForwarded.Add(1)
 	}
 }
 

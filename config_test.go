@@ -118,3 +118,27 @@ func TestConfigSecretNotInValidationErrors(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestConfigDeprecatedProbeKeys(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "c.yaml")
+	if err := os.WriteFile(p, []byte("relay:\n    probe_rate: 5000\n    probe_burst: 10000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadOrCreateConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("config with deprecated probe keys rejected: %v", err)
+	}
+
+	fresh := filepath.Join(dir, "new.yaml")
+	if _, err := loadOrCreateConfig(fresh); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(fresh)
+	if strings.Contains(string(data), "probe_") {
+		t.Fatal("new config still writes deprecated probe keys")
+	}
+}

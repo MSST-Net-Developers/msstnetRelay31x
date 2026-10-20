@@ -39,7 +39,7 @@ const (
 	sregPayloadLen = sdiscCounterLen + sdiscTagLen
 )
 
-// regAuthMode controls unauthenticated registration (0x01/0x02/0x03).
+// regAuthMode controls unauthenticated registration (0x01/0x02).
 type regAuthMode uint8
 
 const (

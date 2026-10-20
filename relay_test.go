@@ -132,16 +132,27 @@ func TestWireGuardDrops(t *testing.T) {
 
 func TestRetiredTypesDropped(t *testing.T) {
 	r, w := newTestRelay(t, testLimits(), fakeRooms{room: {idA, idB}})
+	r.handle(encodePacket(typRegister, idA, 0, nil), addrA, t0)
 	r.handle(encodePacket(typRegister, idB, 0, nil), addrB, t0)
+	probe := make([]byte, 12) // seq(4) + timestamp_ms(8)
 
+	// 0x03 (3.0.x punch) no longer registers: it cannot move B.
+	r.handle(encodePacket(typRetiredPunch, idB, 0, nil), addrC, t0)
 	// Plaintext data (0x04) is no longer forwarded in any form.
 	r.handle(encodePacket(typRetiredData, idA, idB, fakeIPv4(20, 0)), addrA, t0)
+	// P2P ping/pong (0x06/0x07) between registered devices is not relayed:
+	// clients measure the relay path inside the tunnel (0x0D).
+	r.handle(encodePacket(typRetiredP2PPing, idA, idB, probe), addrA, t0)
+	r.handle(encodePacket(typRetiredP2PPong, idB, idA, probe), addrB, t0)
 	// Unauthenticated discovery (0x08/0x09) creates no binding and is not
 	// fanned out, so it can neither hijack nor inject.
 	r.handle(encodePacket(typRetiredDiscoveryRegister, idB, 0, nil), addrC, t0)
 	r.handle(encodePacket(typRetiredDiscoveryData, idA, 0, discoveryPayload(room, fakeIPv4(20, 0))), addrA, t0)
-	if len(w.take()) != 0 || r.discSessions.len() != 0 || r.stats.dropRetired.Load() != 3 {
+	if len(w.take()) != 0 || r.discSessions.len() != 0 || r.stats.dropRetired.Load() != 6 {
 		t.Fatalf("retired types handled: disc_sessions=%d retired=%d", r.discSessions.len(), r.stats.dropRetired.Load())
+	}
+	if b, _ := r.sessions.lookup(idB, t0); b != addrB || r.stats.rebinds.Load() != 0 {
+		t.Fatalf("0x03 moved a binding to %s", b)
 	}
 }
 
@@ -190,7 +201,7 @@ func TestRegistrationValidation(t *testing.T) {
 	}
 
 	r.handle(encodePacket(typRegister, idA, 0, nil), addrA, t0)
-	r.handle(encodePacket(typPunch, idB, 0, nil), addrB, t0) // legacy punch registers
+	r.handle(encodePacket(typKeepalive, idB, 0, nil), addrB, t0) // keepalive also registers
 	r.handle(encodePacket(typRegister, idC, 0, nil), addrC, t0)
 	if r.sessions.len() != 2 || r.stats.sessionsFull.Load() != 1 {
 		t.Fatalf("capacity not enforced: len=%d full=%d", r.sessions.len(), r.stats.sessionsFull.Load())
@@ -219,60 +230,6 @@ func TestPingEcho(t *testing.T) {
 	r.handle(ping, addrA, t0)
 	if n := len(w.take()); n != 1 {
 		t.Fatalf("rate limit: echoed %d, want 1", n)
-	}
-}
-
-func TestP2PProbeForwarding(t *testing.T) {
-	r, w := newTestRelay(t, testLimits(), nil)
-	r.handle(encodePacket(typRegister, idA, 0, nil), addrA, t0)
-	r.handle(encodePacket(typRegister, idB, 0, nil), addrB, t0)
-
-	payload := make([]byte, pingPayloadLen)
-	ping := encodePacket(typP2PPing, idA, idB, payload)
-	r.handle(ping, addrA, t0)
-	out := w.take()
-	if len(out) != 1 || out[0].dst != addrB || !bytes.Equal(out[0].b, ping) {
-		t.Fatalf("p2p ping not forwarded verbatim: %+v", out)
-	}
-
-	// The pong comes from the peer's main socket; that need not be
-	// registered here.
-	pong := encodePacket(typP2PPong, idB, idA, payload)
-	r.handle(pong, addrC, t0)
-	out = w.take()
-	if len(out) != 1 || out[0].dst != addrA || !bytes.Equal(out[0].b, pong) {
-		t.Fatalf("p2p pong not forwarded verbatim: %+v", out)
-	}
-}
-
-func TestP2PProbeDrops(t *testing.T) {
-	lim := testLimits()
-	r, w := newTestRelay(t, lim, nil)
-	r.handle(encodePacket(typRegister, idA, 0, nil), addrA, t0)
-	r.handle(encodePacket(typRegister, idB, 0, nil), addrB, t0)
-	payload := make([]byte, pingPayloadLen)
-
-	// Spoofed src_id: idA is not bound to addrC.
-	r.handle(encodePacket(typP2PPing, idA, idB, payload), addrC, t0)
-	// Short payload.
-	r.handle(encodePacket(typP2PPing, idA, idB, payload[:4]), addrA, t0)
-	// Destination bound to the source address (relay loop).
-	r.handle(encodePacket(typP2PPong, idC, idB, payload), addrB, t0)
-	if out := w.take(); len(out) != 0 {
-		t.Fatalf("forwarded: %+v", out)
-	}
-	if r.stats.dropUnverifiedSrc.Load() != 1 || r.stats.dropLoop.Load() != 1 {
-		t.Fatal("drop counters wrong")
-	}
-
-	lim.probeRate, lim.probeBurst = 1, 1
-	r, w = newTestRelay(t, lim, nil)
-	r.handle(encodePacket(typRegister, idA, 0, nil), addrA, t0)
-	for range 3 {
-		r.handle(encodePacket(typP2PPong, idB, idA, payload), addrB, t0)
-	}
-	if n := len(w.take()); n != 1 {
-		t.Fatalf("probe rate limit: forwarded %d, want 1", n)
 	}
 }
 

@@ -199,17 +199,17 @@ func TestUnauthenticatedRegisterOptional(t *testing.T) {
 	f := newSregFixture(t, regAuthOptional)
 	evil := ap("192.0.2.66:4444")
 
-	// Devices that have not upgraded still register with 0x01/0x02/0x03.
+	// Devices that have not upgraded still register with 0x01/0x02.
 	f.r.handle(encodePacket(typRegister, idA, 0, nil), addrA, tNow)
 	if a, _ := f.r.sessions.lookup(idA, tNow); a != addrA {
 		t.Fatal("0x01 refused in optional mode")
 	}
 	// An authenticated binding cannot be taken over by them.
 	f.r.handle(f.reg(idB, tNow), addrB, tNow)
-	for _, typ := range []byte{typRegister, typKeepalive, typPunch} {
+	for _, typ := range []byte{typRegister, typKeepalive} {
 		f.r.handle(encodePacket(typ, idB, 0, nil), evil, tNow)
 	}
-	if a, _ := f.r.sessions.lookup(idB, tNow); a != addrB || f.r.stats.dropUnauthRegister.Load() != 3 {
+	if a, _ := f.r.sessions.lookup(idB, tNow); a != addrB || f.r.stats.dropUnauthRegister.Load() != 2 {
 		t.Fatalf("legacy register hijacked authenticated binding: %s", a)
 	}
 	// An unauthenticated binding is upgraded by 0x0E.
@@ -227,10 +227,10 @@ func TestUnauthenticatedRegisterOptional(t *testing.T) {
 
 func TestUnauthenticatedRegisterRequired(t *testing.T) {
 	f := newSregFixture(t, regAuthRequired)
-	for _, typ := range []byte{typRegister, typKeepalive, typPunch} {
+	for _, typ := range []byte{typRegister, typKeepalive} {
 		f.r.handle(encodePacket(typ, idA, 0, nil), addrA, tNow)
 	}
-	if f.r.sessions.len() != 0 || f.r.stats.dropUnauthRegister.Load() != 3 {
+	if f.r.sessions.len() != 0 || f.r.stats.dropUnauthRegister.Load() != 2 {
 		t.Fatal("unauthenticated registration accepted in required mode")
 	}
 	f.r.handle(f.reg(idA, tNow), addrA, tNow)

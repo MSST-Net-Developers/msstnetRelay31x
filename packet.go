@@ -25,25 +25,26 @@ const (
 
 	typRegister  = 0x01
 	typKeepalive = 0x02
-	typPunch     = 0x03 // legacy; treated as register (3.0.x behaviour)
 	typPing      = 0x05
-	typP2PPing   = 0x06
-	typP2PPong   = 0x07
 	typWireGuard = 0x0D // one WireGuard message; all peer data in 3.1.x
-	// 0x0A–0x0C: secure discovery, see sdisc.go.
+	// 0x0A–0x0C: secure discovery, see sdisc.go; 0x0E: sreg, see sreg.go.
 
-	// Retired 3.0.x types, dropped and counted: plaintext data (0x04) and
-	// unauthenticated discovery (0x08/0x09). 3.1.x clients never send them.
+	// Retired types, dropped and counted; 3.1.x clients never send them to a
+	// relay. 0x03 (3.0.x punch) was only an extra unauthenticated register
+	// path. 0x04 is plaintext data. 0x06/0x07 (P2P ping/pong) are used only
+	// between clients directly; the relay-path RTT is measured inside the
+	// WireGuard tunnel (0x0D) since client 2be46a5. 0x08/0x09 are
+	// unauthenticated discovery.
+	typRetiredPunch             = 0x03
 	typRetiredData              = 0x04
+	typRetiredP2PPing           = 0x06
+	typRetiredP2PPong           = 0x07
 	typRetiredDiscoveryRegister = 0x08
 	typRetiredDiscoveryData     = 0x09
 
 	// minWireGuardLen is the smallest WireGuard message (a transport
 	// keepalive: 16-byte header + 16-byte tag).
 	minWireGuardLen = 32
-
-	// pingPayloadLen is the P2P ping/pong payload: seq(4) + timestamp_ms(8).
-	pingPayloadLen = 12
 
 	// maxPingEchoLen caps the size of a relay ping (0x05) that is echoed back.
 	// Clients send header-only (23 byte) pings; the cap prevents the relay from

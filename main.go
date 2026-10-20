@@ -60,6 +60,9 @@ func main() {
 	}
 	auth := newSdiscAuth(priv)
 	log.Printf("relay public key %s; register_auth=%s", auth.publicKeyBase64(), cfg.Relay.RegisterAuth)
+	if cfg.Relay.ProbeRate != 0 || cfg.Relay.ProbeBurst != 0 {
+		log.Printf("relay.probe_rate/probe_burst are deprecated and ignored; 0x06/0x07 are no longer forwarded")
+	}
 	if cfg.Discovery.Enabled && !cfg.Discovery.RequireSenderInRoom {
 		log.Printf("discovery: require_sender_in_room is deprecated and ignored; senders must always be room members")
 	}

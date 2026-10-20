@@ -13,7 +13,7 @@ counters. The HKDF salt differs, so sreg and sdisc keys are independent.
 
 With unauthenticated `0x01`/`0x02` (last writer wins), anyone who can send UDP
 to a relay can bind any device ID to their own address. They receive that
-device's `0x0D`/`0x06`/`0x07` traffic (WireGuard ciphertext, so this is
+device's `0x0D` traffic (WireGuard ciphertext, so this is
 denial of service rather than disclosure) until the device's next keepalive.
 They can also point bindings at other relays to build forwarding loops.
 
@@ -63,7 +63,7 @@ window from sdisc, so the two counters need not be shared.
    A later `0x0E` from another address moves it (NAT rebinding, roaming).
 
 `relay.register_auth` decides what happens to unauthenticated
-`0x01`/`0x02`/`0x03`:
+`0x01`/`0x02` (`0x03` is retired and never registers):
 
 | Mode | Unauthenticated register/keepalive |
 |------|------------------------------------|
