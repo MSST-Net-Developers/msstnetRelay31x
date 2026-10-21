@@ -227,7 +227,7 @@ func (r *relay) secureRegister(p packet, src netip.AddrPort, now time.Time) {
 // relay is processed there again. A two-relay loop (spoofed registrations
 // pointing R1 and R2 at each other) is cut by the dst == src check; longer
 // cycles need spoofed registrations at three or more relays and are not
-// detected (see README.md "Trust model").
+// detected (see REFERENCE.md "Trust model").
 func (r *relay) forwardWireGuard(p packet, src netip.AddrPort, now time.Time) {
 	if len(p.payload) < minWireGuardLen {
 		r.stats.dropMalformed.Add(1)

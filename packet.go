@@ -18,7 +18,7 @@ import (
 //	[payload: N]
 //
 // Only secure discovery (0x0A–0x0C) is authenticated; elsewhere src_id is a
-// claim, not proof of identity. See README.md "Trust model".
+// claim, not proof of identity. See REFERENCE.md "Trust model".
 const (
 	headerLen       = 4 + 1 + 1 + 1 + 8 + 8 // 23
 	protocolVersion = 1
