@@ -125,3 +125,7 @@ within the Coordinator's per-IP rate limit.
 
 Observability is a periodic stats log line; there is no admin/HTTP
 interface. Diagnostic logs that remote parties can trigger are rate-limited.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

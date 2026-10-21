@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -523,7 +524,7 @@ func TestRelayKeyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
+	if fi, _ := os.Stat(path); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("key file mode %o", fi.Mode().Perm())
 	}
 	k2, err := loadOrCreateRelayKey(path)

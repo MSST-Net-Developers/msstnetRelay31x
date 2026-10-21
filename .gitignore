@@ -25,3 +25,7 @@ config.yml
 # Relay secure-discovery private key
 relay_discovery.key
 *.key
+
+# AI
+.mimocode
+.claude
