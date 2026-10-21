@@ -29,3 +29,6 @@ relay_discovery.key
 # AI
 .mimocode
 .claude
+
+# Release packages (scripts/build-release.sh)
+/dist/

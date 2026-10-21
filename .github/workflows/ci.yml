@@ -3,15 +3,18 @@ name: CI
 on:
   push:
     branches: [master, main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  # Release tags run this through release.yml before publishing.
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Fixed prefix: when called from release.yml, github.workflow is the
+  # caller's name and would collide with its concurrency group.
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

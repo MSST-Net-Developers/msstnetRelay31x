@@ -22,15 +22,24 @@ MSST-Net 的 UDP 中转服务。两台设备无法直连时，由它转发 WireG
 
 ## 快速开始
 
-从 [Actions](https://github.com/MSST-Net-Developers/msstnetRelay31x/actions) 的构建产物下载对应平台的二进制，或自行编译（需要 Go 1.27+）：
+从 [Releases](https://github.com/MSST-Net-Developers/msstnetRelay31x/releases) 下载对应平台的预编译包（Linux / Windows / macOS，amd64 与 arm64），解压后运行：
 
 ```bash
-go build -o msstnetRelay31x .
 ./msstnetRelay31x -config config.yaml               # 首次运行生成默认配置（权限 0600）
 ./msstnetRelay31x -config config.yaml -print-link   # 自托管：打印连接串后退出
+./msstnetRelay31x -version
 ```
 
 默认监听 UDP 21031。按文档站说明填好 `config.yaml` 后重启即可。
+
+校验下载的文件：
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify msstnetRelay31x_<版本>_linux_amd64.tar.gz -R MSST-Net-Developers/msstnetRelay31x
+```
+
+也可以自行编译（需要 Go 1.27+）：`go build -o msstnetRelay31x .`
 
 ## 开发
 
@@ -39,6 +48,8 @@ go vet ./... && go test -race ./...
 ```
 
 CI 在 Linux、macOS、Windows 上运行测试，并构建 linux / windows / darwin 的 amd64 与 arm64 版本。
+
+**发布**：推送形如 `v1.2.3` 的标签（`v1.2.3-rc.1` 发布为预发布版）。`release.yml` 先跑完整 CI，再用 `scripts/build-release.sh` 打包、生成 `SHA256SUMS` 与构建来源证明，发布到 GitHub Releases。本地可用 `scripts/build-release.sh v1.2.3` 预先检查打包结果（输出到 `dist/`）。
 
 ## 许可证
 

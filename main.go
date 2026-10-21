@@ -19,10 +19,20 @@ import (
 // that datagrams are never silently truncated.
 const maxDatagram = 65535
 
+// version is set at build time (-ldflags "-X main.version=v1.2.3") by the
+// release workflow.
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", defaultConfigFile, "path to config file")
 	printLink := flag.Bool("print-link", false, "print the relay connection link and exit")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("msstnetRelay31x", version)
+		return
+	}
 
 	if *printLink {
 		link, err := linkFromConfig(*configPath)
@@ -56,7 +66,7 @@ func main() {
 	if err := conn.SetWriteBuffer(cfg.Relay.SocketWriteBuffer); err != nil {
 		log.Printf("SetWriteBuffer: %v", err)
 	}
-	log.Printf("relay listening on udp/%s", conn.LocalAddr())
+	log.Printf("msstnetRelay31x %s listening on udp/%s", version, conn.LocalAddr())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

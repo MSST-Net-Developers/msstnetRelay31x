@@ -1,0 +1,52 @@
+name: Release
+
+# Pushing a tag like v1.2.3 (or v1.2.3-rc.1, published as a pre-release)
+# runs the full CI, then publishes prebuilt packages to GitHub Releases:
+# linux/windows/darwin × amd64/arm64, each with LICENSE, THIRD_PARTY_NOTICES
+# and README.md, plus SHA256SUMS and build provenance attestations.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write     # create the release
+      id-token: write     # sign provenance
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false   # release builds do not reuse caches
+      - name: Build packages
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: scripts/build-release.sh "$VERSION" dist
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          flags=()
+          if [[ $VERSION == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$VERSION" dist/* \
+            --verify-tag --generate-notes --title "msstnetRelay31x $VERSION" "${flags[@]}"
