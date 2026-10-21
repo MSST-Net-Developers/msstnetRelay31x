@@ -13,6 +13,12 @@ func TestUDPEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Like main. On macOS SO_SNDBUF also caps the datagram size (default
+	// 9216 bytes), so the relay could not forward the 65507-byte frame below
+	// without it.
+	if err := conn.SetWriteBuffer(defaultConfig().Relay.SocketWriteBuffer); err != nil {
+		t.Fatal(err)
+	}
 	r := newRelay(conn, testLimits(), nil, &stats{})
 	done := make(chan struct{})
 	go func() { serve(conn, r); close(done) }()
@@ -24,6 +30,10 @@ func TestUDPEndToEnd(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = c.Close() })
+		// Room for the largest datagram on macOS (see above).
+		if err := c.SetWriteBuffer(1 << 20); err != nil {
+			t.Fatal(err)
+		}
 		return c
 	}
 	recv := func(c *net.UDPConn) []byte {
