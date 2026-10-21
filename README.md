@@ -128,4 +128,7 @@ interface. Diagnostic logs that remote parties can trigger are rate-limited.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Release binaries also include the third-party
+software listed in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) (BSD-3-Clause,
+MIT, Apache-2.0); ship that file with any binary you distribute and update
+it when dependencies change (CI checks the module versions).

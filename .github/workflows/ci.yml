@@ -49,6 +49,22 @@ jobs:
           fi
       - name: go mod verify
         run: go mod verify
+      # Every third-party module linked into a release binary must be listed
+      # with its exact version in THIRD_PARTY_NOTICES.
+      - name: third-party notices
+        if: runner.os == 'Linux'
+        run: |
+          mods=$(for goos in linux windows darwin; do
+            GOOS=$goos go list -deps -f '{{if not .Standard}}{{with .Module}}{{if not .Main}}{{.Path}} {{.Version}}{{end}}{{end}}{{end}}' .
+          done | sort -u)
+          status=0
+          while read -r mod; do
+            [ -z "$mod" ] && continue
+            if ! grep -qF "$mod" THIRD_PARTY_NOTICES; then
+              echo "THIRD_PARTY_NOTICES is missing: $mod"; status=1
+            fi
+          done <<< "$mods"
+          exit $status
       - name: go vet
         run: go vet ./...
       - name: go test
@@ -80,7 +96,7 @@ jobs:
           if [ "$GOOS" = windows ]; then ext=".exe"; fi
           out="dist/msstnetRelay31x-${GOOS}-${GOARCH}${ext}"
           go build -trimpath -ldflags="-s -w" -o "$out" .
-          cp LICENSE README.md dist/
+          cp LICENSE THIRD_PARTY_NOTICES README.md dist/
           ls -l dist
       - uses: actions/upload-artifact@v7
         with:
