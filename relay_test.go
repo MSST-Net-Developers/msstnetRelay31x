@@ -43,8 +43,13 @@ func (f fakeRooms) peers(roomID []byte, _ time.Time) ([]discPeer, bool) {
 	return list, true
 }
 
+// testLimits are the default limits, but with register_auth optional: most
+// tests register with plain 0x01 (forwarding doesn't depend on how a
+// binding was made); sreg_test.go covers required mode.
 func testLimits() relayLimits {
-	return defaultConfig().limits()
+	lim := defaultConfig().limits()
+	lim.regAuth = regAuthOptional
+	return lim
 }
 
 func newTestRelay(t *testing.T, lim relayLimits, rooms roomPeerLookup) (*relay, *fakeWriter) {

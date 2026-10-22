@@ -486,12 +486,22 @@ func TestCoordinatorKeyFetcher(t *testing.T) {
 // ── Config ───────────────────────────────────────────────────────────────
 
 func TestConfigRegisterAuth(t *testing.T) {
+	if defaultConfig().Relay.RegisterAuth != "required" || defaultConfig().limits().regAuth != regAuthRequired {
+		t.Fatal("register_auth must default to required")
+	}
 	for _, c := range []struct {
 		name string
 		mut  func(*Config)
 		ok   bool
 	}{
-		{"default optional", func(c *Config) {}, true},
+		// The default is required, which needs the Coordinator.
+		{"default without coordinator", func(c *Config) {}, false},
+		{"default with coordinator", func(c *Config) {
+			c.Control.ServerURL = "https://c.example"
+			c.Node = NodeConfig{ID: "r", Region: "x", Addr: "r:1"}
+		}, true},
+		{"optional without coordinator", func(c *Config) { c.Relay.RegisterAuth = "optional" }, true},
+		{"empty means required", func(c *Config) { c.Relay.RegisterAuth = "" }, false},
 		{"required without coordinator", func(c *Config) { c.Relay.RegisterAuth = "required" }, false},
 		{"required with coordinator", func(c *Config) {
 			c.Relay.RegisterAuth = "required"

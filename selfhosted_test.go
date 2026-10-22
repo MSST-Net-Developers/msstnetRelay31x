@@ -93,7 +93,7 @@ func TestConfigSelfHosted(t *testing.T) {
 		{"no node id/region needed", func(c *Config) { c.Node.ID, c.Node.Region = "", "" }, true},
 		{"password", func(c *Config) { c.Relay.Password = "pw" }, true},
 		{"register_auth optional", func(c *Config) { c.Relay.RegisterAuth = "optional" }, false},
-		{"register_auth default", func(c *Config) { c.Relay.RegisterAuth = "" }, false},
+		{"register_auth empty (required)", func(c *Config) { c.Relay.RegisterAuth = "" }, true},
 		{"relay_secret set", func(c *Config) { c.Control.RelaySecret = "official" }, false},
 		{"http coordinator", func(c *Config) { c.Control.ServerURL = "http://coord.example.com" }, false},
 		{"no coordinator", func(c *Config) { c.Control.ServerURL = "" }, false},

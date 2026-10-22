@@ -554,7 +554,7 @@ func TestConfigAuth(t *testing.T) {
 		{"skew vs ttl", func(c *Config) { c.Discovery.AuthMaxClockSkew = 61 * time.Second }, false},
 		{"deprecated require_sender_in_room", func(c *Config) { c.Discovery.RequireSenderInRoom = false }, true},
 	} {
-		cfg := defaultConfig()
+		cfg := withCoordinator(defaultConfig())
 		c.mut(cfg)
 		if err := cfg.validate(); (err == nil) != c.ok {
 			t.Errorf("%s: err=%v", c.name, err)

@@ -4,8 +4,7 @@ Authenticates relay register/keepalive with the device's X25519 identity key,
 so a device ID can no longer be registered by someone who does not hold its
 private key. Relay side implemented in `sreg.go`; Coordinator side in
 msstnetCoordinator31x `356e399`, client side in msst-net-core-31x `67deacf`.
-What remains is the last rollout step (`register_auth: required`, see
-Deployment order).
+`register_auth: required` is the default (see Deployment order).
 
 Same building blocks as secure discovery (SECURE_DISCOVERY.md): the relay's
 static X25519 key, HKDF-SHA256, a truncated HMAC-SHA256 tag and time-based
@@ -69,7 +68,7 @@ window from sdisc, so the two counters need not be shared.
 
 | Mode | Unauthenticated register/keepalive |
 |------|------------------------------------|
-| `optional` (default) | accepted, **except** for an ID whose live binding was made by `0x0E` (`reg_drop{unauth}`) |
+| `optional` | accepted, **except** for an ID whose live binding was made by `0x0E` (`reg_drop{unauth}`) |
 | `required` | dropped (`reg_drop{unauth}`) |
 
 Bindings expire after `relay.session_ttl` (120 s) without a valid
@@ -148,9 +147,10 @@ X-Relay-Secret: <relay_secret>
    `device_key_proof: required` still to be switched on.
 3. Clients send `0x0E` to relays advertising `sreg1`. Done in the client;
    takes effect as clients upgrade.
-4. Relays switch to `register_auth: required` once no clients without
-   `0x0E` remain (official relays; self-hosted relays require it already,
-   SELF_HOSTED.md).
+4. `register_auth: required` — the default (also when the field is empty).
+   It needs `control.server_url`; a relay without a Coordinator (e.g. for
+   development) must set `register_auth: optional` explicitly.
+   Self-hosted relays require it in any case (SELF_HOSTED.md).
 
 ## Test vectors
 

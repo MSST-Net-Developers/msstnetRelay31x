@@ -60,9 +60,11 @@ type RelayConfig struct {
 	ProbeBurst int     `yaml:"probe_burst,omitempty"`
 
 	// RegisterAuth controls unauthenticated register/keepalive
-	// (0x01/0x02; REGISTRATION_AUTH.md): "optional" accepts them unless
-	// the device ID has a live binding made by authenticated 0x0E; "required"
-	// drops them (only after all clients send 0x0E).
+	// (0x01/0x02; REGISTRATION_AUTH.md): "required" (the default, also when
+	// empty) drops them — every 3.1 client sends authenticated 0x0E —
+	// and needs control.server_url (device keys come from the Coordinator);
+	// "optional" accepts them unless the device ID has a live binding made
+	// by 0x0E (for a relay without a Coordinator, e.g. development).
 	RegisterAuth string `yaml:"register_auth"`
 	// Device public keys for 0x0E come from the Coordinator. A key is
 	// refreshed after DeviceKeyTTL and served for DeviceKeyStaleTTL after the
@@ -157,7 +159,7 @@ func defaultConfig() *Config {
 			SessionTTL:          120 * time.Second,
 			PingRate:            2000,
 			PingBurst:           4000,
-			RegisterAuth:        "optional",
+			RegisterAuth:        "required",
 			DeviceKeyTTL:        10 * time.Minute,
 			DeviceKeyStaleTTL:   time.Hour,
 			DeviceKeyMaxEntries: 65536,

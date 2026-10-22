@@ -52,8 +52,8 @@ global egress budget. No bare IPv4 is ever sent.
   end between clients, and the relay forwards it without inspecting it.
 - **Registration:** devices using sreg (`0x0E`, REGISTRATION_AUTH.md) hold
   bindings that only the key holder can move. Unauthenticated `0x01`/`0x02`
-  remain accepted in `register_auth: optional` (the default, until clients
-  send 0x0E). For devices still using them, `src_id` is a claim: anyone who
+  remain accepted only in `register_auth: optional` (the default is
+  `required`: every 3.1 client sends 0x0E). For devices still using them, `src_id` is a claim: anyone who
   can send UDP to the relay can divert their 0x0D traffic until
   their next keepalive (denial of service; WireGuard keeps the content
   confidential). `register_auth: required` closes this. Even with sreg, an
@@ -102,7 +102,7 @@ but ignored, because senders must always be room members; so are
 | `relay.max_sessions` | 65536 | bounded state |
 | `relay.session_ttl` | 120s | client keepalive is 5–30 s (default 25 s) |
 | `relay.ping_rate/burst` | 2000/4000 | bounds reflection to spoofed sources |
-| `relay.register_auth` | optional | `optional` / `required` (unauthenticated 0x01/0x02); must be `required` when self-hosted |
+| `relay.register_auth` | required | `required` / `optional` (unauthenticated 0x01/0x02); `required` needs `control.server_url`; must be `required` when self-hosted |
 | `relay.mode` | official | `official` / `self_hosted` ([SELF_HOSTED.md](SELF_HOSTED.md)) |
 | `relay.password` | (none) | self-hosted only; room owners must give it to designate the relay |
 | `relay.require_room_password` | true | self-hosted only; Coordinator refuses rooms without a room password |

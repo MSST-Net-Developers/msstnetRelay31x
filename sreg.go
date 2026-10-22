@@ -49,9 +49,9 @@ const (
 
 func parseRegAuthMode(s string) (regAuthMode, error) {
 	switch s {
-	case "optional", "":
+	case "optional":
 		return regAuthOptional, nil
-	case "required":
+	case "required", "":
 		return regAuthRequired, nil
 	}
 	return 0, fmt.Errorf("unknown mode %q (want optional or required)", s)

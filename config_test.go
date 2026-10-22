@@ -9,14 +9,27 @@ import (
 	"time"
 )
 
+// withCoordinator completes cfg with what an official relay needs to run
+// with the default register_auth (required): the Coordinator and the node.
+func withCoordinator(cfg *Config) *Config {
+	cfg.Control.ServerURL = "https://c.example"
+	cfg.Node = NodeConfig{ID: "r", Region: "x", Addr: "r:1"}
+	return cfg
+}
+
 func TestConfigCreateDefault(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	cfg, err := loadOrCreateConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cfg.validate(); err != nil {
-		t.Fatalf("default config invalid: %v", err)
+	// register_auth is required by default, which needs the Coordinator
+	// (device keys): that is all a fresh config lacks.
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "control.server_url") {
+		t.Fatalf("default config: err = %v, want control.server_url needed", err)
+	}
+	if err := withCoordinator(cfg).validate(); err != nil {
+		t.Fatalf("default config with a coordinator invalid: %v", err)
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -131,7 +144,7 @@ func TestConfigDeprecatedProbeKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cfg.validate(); err != nil {
+	if err := withCoordinator(cfg).validate(); err != nil {
 		t.Fatalf("config with deprecated probe keys rejected: %v", err)
 	}
 
