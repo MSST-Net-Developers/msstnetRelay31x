@@ -3,7 +3,11 @@ name: Release
 # Pushing a tag like v1.2.3 (or v1.2.3-rc.1, published as a pre-release)
 # runs the full CI, then publishes prebuilt packages to GitHub Releases:
 # linux/windows/darwin × amd64/arm64, each with LICENSE, THIRD_PARTY_NOTICES
-# and README.md, plus SHA256SUMS and build provenance attestations.
+# and README.md, plus SHA256SUMS and build provenance attestations. The
+# release is then synced to Gitee.
+#
+# Repository secret: GITEE_TOKEN. Repository variables (optional):
+# GITEE_OWNER (default Abjust) and GITEE_REPO (default msstnetRelay31x).
 on:
   push:
     tags: ["v*"]
@@ -50,3 +54,24 @@ jobs:
           if [[ $VERSION == *-* ]]; then flags+=(--prerelease); fi
           gh release create "$VERSION" dist/* \
             --verify-tag --generate-notes --title "msstnetRelay31x $VERSION" "${flags[@]}"
+
+  sync-gitee:
+    name: Sync the Release to Gitee
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+      # Only this tag's release: created on Gitee if missing, its missing
+      # files uploaded; other releases are left alone.
+      - run: .github/scripts/sync-gitee-release.sh
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GITEE_OWNER: ${{ vars.GITEE_OWNER || 'Abjust' }}
+          GITEE_REPO: ${{ vars.GITEE_REPO || 'msstnetRelay31x' }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          RETRIES: 3
