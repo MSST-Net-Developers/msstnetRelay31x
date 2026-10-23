@@ -32,6 +32,8 @@ MSST-Net 的 UDP 中转服务。两台设备无法直连时，由它转发 WireG
 
 默认监听 UDP 21031。按文档站说明填好 `config.yaml` 后重启即可。
 
+日志同时写到标准错误和工作目录下的 `relay.log`（权限 0600），按大小轮转：默认每个文件 50 MB，保留 `relay.log.1` 至 `relay.log.5` 五个旧文件。可用 `log.file`、`log.max_size_mb`、`log.max_backups` 调整；`log.file` 设为空则只写标准错误。
+
 校验下载的文件：
 
 ```bash

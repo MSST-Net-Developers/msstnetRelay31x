@@ -74,6 +74,26 @@ control:
 	if cfg.Node.ID != "relay-hk-1" || cfg.Relay.MaxSessions != 65536 || cfg.Control.RelaySecret != "" {
 		t.Fatalf("unexpected: %+v", cfg)
 	}
+	// Existing configs get the log file without editing them.
+	if cfg.Log.File != "relay.log" || cfg.Log.MaxSizeMB != 50 || cfg.Log.MaxBackups != 5 {
+		t.Fatalf("log defaults: %+v", cfg.Log)
+	}
+}
+
+func TestConfigLogFile(t *testing.T) {
+	cfg := withCoordinator(defaultConfig())
+	cfg.Log.MaxSizeMB = 0
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "log.max_size_mb") {
+		t.Fatalf("max_size_mb 0: err = %v", err)
+	}
+	cfg.Log.File = "" // off: the size does not matter
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("file logging off: %v", err)
+	}
+	cfg.Log.MaxBackups = -1
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "log.max_backups") {
+		t.Fatalf("max_backups -1: err = %v", err)
+	}
 }
 
 func TestConfigRejectsUnknownAndInvalid(t *testing.T) {

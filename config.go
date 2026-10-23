@@ -147,6 +147,12 @@ type ControlConfig struct {
 type LogConfig struct {
 	// StatsInterval is how often a counters line is logged; 0 disables.
 	StatsInterval time.Duration `yaml:"stats_interval"`
+	// File also writes the log to this file (relative paths: to the working
+	// directory), mode 0600; empty: stderr only. Rotated by size into
+	// File.1 … File.<max_backups>.
+	File       string `yaml:"file"`
+	MaxSizeMB  int    `yaml:"max_size_mb"`
+	MaxBackups int    `yaml:"max_backups"`
 }
 
 func defaultConfig() *Config {
@@ -194,6 +200,9 @@ func defaultConfig() *Config {
 		},
 		Log: LogConfig{
 			StatsInterval: 60 * time.Second,
+			File:          "relay.log",
+			MaxSizeMB:     50,
+			MaxBackups:    5,
 		},
 	}
 }
@@ -324,6 +333,12 @@ func (c *Config) validate() error {
 	}
 	if c.Log.StatsInterval < 0 {
 		bad("log.stats_interval must be >= 0")
+	}
+	if c.Log.File != "" && c.Log.MaxSizeMB < 1 {
+		bad("log.max_size_mb must be >= 1")
+	}
+	if c.Log.MaxBackups < 0 {
+		bad("log.max_backups must be >= 0")
 	}
 	if c.Control.ServerURL != "" {
 		u, err := url.Parse(c.Control.ServerURL)

@@ -50,6 +50,12 @@ func main() {
 	if err := cfg.validate(); err != nil {
 		log.Fatalf("config %s: %v", *configPath, err)
 	}
+	logFile, err := setupLogFile(cfg.Log.File, cfg.Log.MaxSizeMB, cfg.Log.MaxBackups)
+	if err != nil {
+		// Relaying matters more than the log file: go on with stderr only.
+		log.Printf("log file %s: %v; logging to stderr only", cfg.Log.File, err)
+	}
+	defer logFile.Close()
 
 	udpAddr, err := net.ResolveUDPAddr("udp", cfg.Relay.Bind)
 	if err != nil {

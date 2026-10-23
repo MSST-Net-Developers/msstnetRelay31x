@@ -22,6 +22,10 @@ Thumbs.db
 config.yaml
 config.yml
 
+# Logs (log.file, rotated)
+*.log
+*.log.[0-9]*
+
 # Relay secure-discovery private key
 relay_discovery.key
 *.key

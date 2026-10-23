@@ -118,6 +118,8 @@ but ignored, because senders must always be room members; so are
 | `discovery.auth_key_file` | relay_discovery.key | relay X25519 key (sdisc and sreg), created 0600 |
 | `discovery.auth_max_clock_skew` | 30s | sdisc/sreg counter freshness; both session TTLs must be ≥ 2× |
 | `log.stats_interval` | 60s | counters line; 0 disables |
+| `log.file` | relay.log | log also written here (mode 0600, relative to the working directory); empty: stderr only. Fails to open → stderr only, the relay still starts |
+| `log.max_size_mb` / `log.max_backups` | 50 / 5 | rotate by size into `relay.log.1` … `.5` (newest first): at most ~300 MB on disk |
 
 Coordinator lookups are additionally limited (room lists 10/s, burst 20, 2
 workers; device keys ≤ 10 batched requests/s, 1 worker) so the relay stays
